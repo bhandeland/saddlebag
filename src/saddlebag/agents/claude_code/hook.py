@@ -82,6 +82,10 @@ def session_start(
                         identity.project,
                         config,
                         now=datetime.now(timezone.utc),
+                        # A session start pays for every candidate it
+                        # counts, so the banner asks for far fewer than a
+                        # typed command does.
+                        awaiting_limit=stats.BANNER_AWAITING_LIMIT,
                         current_root=Path(payload_cwd)
                         if isinstance(payload_cwd, str)
                         else None,

@@ -34,6 +34,7 @@ from saddlebag.domain import (
     TranscriptRun,
 )
 from saddlebag.services import (
+    events,
     extraction,
     handoff,
     ingest,
@@ -50,6 +51,18 @@ from saddlebag.store import Store
 STATEMENT_TIMEOUT_MS = 1500
 
 LABEL_WIDTH = 10
+
+#: How many awaiting-extraction candidates the BANNER counts. Deliberately
+#: far below `events.STATUS_AWAITING_LIMIT`, which `bag stats` and `bag
+#: record status` still use: that constant is justified for a command a
+#: person typed, and the cost here is one aggregate over the never-pruned
+#: `events` table plus one `extract_job_for_session` round-trip per
+#: candidate - a thousand of which the 1.5s `statement_timeout` does not
+#: bound, because it caps each statement and not their sum. A banner line
+#: only has to answer "is extraction behind?", and twenty-five is already
+#: past the point where the answer is yes; the exact figure belongs to
+#: `bag record status`, which is where a backlog is investigated anyway.
+BANNER_AWAITING_LIMIT = 25
 
 #: The search tiers in the order `search.find` runs them, which is the
 #: order a reader compares them in. Not derived from the summary's dict:
@@ -88,6 +101,10 @@ class Extraction:
     awaiting: int
     extracted: int
     model: str
+    #: True when `awaiting` hit the limit it was collected under, so the
+    #: figure is a floor. Rendered as `25+`: a capped count printed bare
+    #: would report a backlog of thousands as a tidy twenty-five.
+    capped: bool = False
 
 
 @dataclass(frozen=True)
@@ -159,15 +176,31 @@ def _pct(n: int | float, d: int | float) -> str:
     return "-" if not d else f"{int(100 * n / d + 1e-9)}%"
 
 
+def _window_phrase(window: timedelta) -> str:
+    """The window as one phrase - '7d', '6h', '36h', '90m'.
+
+    The largest unit the window divides exactly into, so `--window 36h`
+    stays 36h rather than becoming the '1d' that `window.days` alone would
+    give it, and `--window 6h` never renders as '0d'. One function because
+    two lines print this - the recall/inject period and the extract line -
+    and they disagreed: the second printed `window.days` raw.
+    """
+    seconds = int(window.total_seconds())
+    if seconds and seconds % 86400 == 0:
+        return f"{seconds // 86400}d"
+    if seconds and seconds % 3600 == 0:
+        return f"{seconds // 3600}h"
+    return f"{max(seconds // 60, 0)}m"
+
+
 def _period(first_at: datetime | None, now: datetime, window: timedelta) -> str | None:
-    """'7d', 'since <date>' when the log is younger than the window, or None
-    when nothing has been logged at all."""
+    """The window phrase, 'since <date>' when the log is younger than the
+    window, or None when nothing has been logged at all."""
     if first_at is None:
         return None
     if first_at > now - window:
         return f"since {first_at.astimezone().date().isoformat()}"
-    days = window.days
-    return f"{days}d" if days else f"{int(window.total_seconds() // 3600)}h"
+    return _window_phrase(window)
 
 
 def _tokens(n: float) -> str:
@@ -193,7 +226,7 @@ def _render_store(counts: EntryCounts, project: str) -> list[str]:
 
 def _render_recall(
     summary: AccessSummary,
-    inj_sessions: int | None,
+    injection: InjectionSummary | None,
     now: datetime,
     window: timedelta,
 ) -> list[str]:
@@ -201,12 +234,19 @@ def _render_recall(
     if period is None:
         return [_label("recall", "no reads logged yet")]
 
-    # Reading sessions out of the session starts that were logged: the
-    # interesting figure is what fraction of sessions consulted the store
-    # at all, and it is unanswerable when the injection half is unavailable.
+    # Injected sessions that went on to read, out of injected sessions -
+    # both counted from `injection_log` by one query, so the ratio compares
+    # one population with itself and its numerator can never exceed its
+    # denominator. A session that read without an injection row is outside
+    # the ratio rather than on one side of it: the CLI reads its session id
+    # from a variable only Claude Code sets, so a cursor or opencode read
+    # carries no session at all and would otherwise be a permanent
+    # under-report. With the injection section unavailable there is no
+    # ratio to draw, and the bare count of reading sessions is what is left
+    # to say.
     sessions = f"{summary.sessions}"
-    if inj_sessions is not None:
-        sessions = f"{summary.sessions}/{inj_sessions}"
+    if injection is not None:
+        sessions = f"{injection.sessions_read}/{injection.sessions}"
 
     parts = [
         f"{period}: {summary.reads} reads in {sessions} sessions",
@@ -267,8 +307,9 @@ def _render_extract(extract: Extraction, window: timedelta) -> list[str]:
             "extract",
             f"{extract.jobs.get('done', 0)} done"
             f" · {extract.jobs.get('failed', 0)} failed"
-            f" · {extract.awaiting} waiting"
-            f" · {window.days}d +{extract.extracted} entries ({extract.model})",
+            f" · {extract.awaiting}{'+' if extract.capped else ''} waiting"
+            f" · {_window_phrase(window)} +{extract.extracted} entries"
+            f" ({extract.model})",
         )
     ]
 
@@ -320,7 +361,22 @@ def _render_recent(entries: list[Entry], now: datetime) -> list[str]:
         title = entry.title
         if len(title) > MAX_TITLE:
             title = f"{title[: MAX_TITLE - 3]}..."
-        text = f"{age}  {entry.kind}  {str(entry.id)[:8]}  {title}  [{entry.origin}]"
+        # The WHOLE id, not a prefix. `cli._entry_id` parses its argument
+        # with a bare `UUID(value)` and refuses anything shorter, and uuid7
+        # is time-ordered so entries written in one batch share their first
+        # eight characters - a live run printed `01a0b630` on all ten lines.
+        # A column that sits where a handle goes and resolves to nothing is
+        # worse than no column, so this one is a handle: `bag get <id>`
+        # works on it as typed.
+        #
+        # The project too, because `recent_entries` is owner-wide by design
+        # while every other line here is explicitly this project or all
+        # projects, and ten chunks of one ingested file are otherwise
+        # unexplained.
+        text = (
+            f"{age}  {entry.kind}  {entry.id}  {entry.project or '-'}"
+            f"  {title}  [{entry.origin}]"
+        )
         lines.append(_label("recent" if not lines else "", text))
     return lines
 
@@ -342,9 +398,7 @@ _RENDERERS: dict[str, tuple[str, Callable[[Any, Stats], list[str]]]] = {
         "recall",
         lambda section, stats: _render_recall(
             section,
-            stats.injection.summary.sessions
-            if isinstance(stats.injection, Injected)
-            else None,
+            stats.injection.summary if isinstance(stats.injection, Injected) else None,
             stats.now,
             stats.window,
         ),
@@ -363,12 +417,48 @@ _RENDERERS: dict[str, tuple[str, Callable[[Any, Stats], list[str]]]] = {
 }
 
 
+def total_failure(stats: Stats) -> str | None:
+    """The one reason every section failed with, if that is what happened.
+
+    A connection lost between the injection and the collection is not seven
+    problems: each section independently fails to open its savepoint and
+    reports the same driver message. The per-section savepoint exists so
+    one failure costs one line, and this is the case where it would
+    otherwise cost seven copies of one line.
+    """
+    reasons = {
+        section.reason
+        for section in (getattr(stats, name) for name in SECTIONS)
+        if isinstance(section, Unavailable)
+    }
+    all_failed = all(isinstance(getattr(stats, name), Unavailable) for name in SECTIONS)
+    return reasons.pop() if all_failed and len(reasons) == 1 else None
+
+
+def collapsed_line(stats: Stats) -> str | None:
+    """The one line that replaces seven, or None when there is no such case.
+
+    Rendered here rather than in `cli.py` so the wording and the label
+    width stay with every other line's - a frontend formats what a service
+    decides, and the decision is `total_failure`.
+    """
+    reason = total_failure(stats)
+    return None if reason is None else _label("stats", f"unavailable ({reason})")
+
+
 def render(stats: Stats) -> list[str]:
     """One or more lines per section, in `SECTIONS` order.
 
     Returns lines rather than printing them: stdout belongs to the MCP
     protocol under the stdio transport, and the banner's caller writes JSON.
+
+    No lines at all when every section failed the same way: the banner
+    falls back to exactly today's single line, which is what the spec asks
+    for when collection fails as a whole. `bag stats` says so in one line
+    of its own - a person typed that one - via `total_failure`.
     """
+    if total_failure(stats) is not None:
+        return []
     lines: list[str] = []
     for name in SECTIONS:
         label, render_one = _RENDERERS[name]
@@ -476,8 +566,15 @@ def collect(
     window: timedelta = timedelta(days=7),
     recent: int = 10,
     current_root: Path | None = None,
+    awaiting_limit: int = events.STATUS_AWAITING_LIMIT,
 ) -> Stats:
     """Every section, each one collected on its own.
+
+    `awaiting_limit` is the one cost a caller has to choose: the default is
+    the constant `bag record status` already uses, imported rather than
+    copied so the two cannot drift, and the SessionStart hook passes
+    `BANNER_AWAITING_LIMIT` instead because that path runs on every session
+    start and pays one round-trip per candidate.
 
     No embedder is ever constructed here - `store.vector_coverage` answers
     coverage from the model name alone. Building a `LocalEmbedder` imports
@@ -521,13 +618,13 @@ def collect(
         return Vectors(embedded=embedded, total=total, model=config.embed_model)
 
     def extract() -> Extraction:
-        # 1000 bounds the discovery query, not the number returned (see
-        # `awaiting_sessions`), so a backlog past a thousand candidates
-        # reports low. Acceptable for one line of a banner: the figure is
-        # there to say "extraction has work", and `bag record status` is
-        # where a real backlog is investigated.
+        # `awaiting_limit` bounds the discovery query, not the number
+        # returned (see `awaiting_sessions`), so a backlog past the limit
+        # reports low - which is why the count says `N+` when it is hit.
+        # The banner passes a much smaller bound than a typed command
+        # does: see `BANNER_AWAITING_LIMIT`.
         awaiting = extraction.awaiting_sessions(
-            store, owner_id, config.idle_minutes * 60, 1000
+            store, owner_id, config.idle_minutes * 60, awaiting_limit
         )
         # `pipeline_counts` again, deliberately: the pipelines section
         # reads the same row, and sharing one result would mean a failure
@@ -538,6 +635,7 @@ def collect(
             awaiting=len(awaiting),
             extracted=store.pipeline_counts(owner_id, since).extracted_since,
             model=config.extract_model,
+            capped=len(awaiting) >= awaiting_limit,
         )
 
     def pipelines() -> Pipelines:

@@ -60,6 +60,7 @@ def _stats(**kw: object) -> st.Stats:
             summary=InjectionSummary(
                 first_at=WEEK_AGO,
                 sessions=14,
+                sessions_read=11,
                 mean_rules=22.0,
                 mean_notes=8.0,
                 mean_tokens=4100.0,
@@ -140,6 +141,7 @@ def test_a_zero_denominator_reaches_the_rendered_line_as_a_dash() -> None:
             summary=InjectionSummary(
                 first_at=WEEK_AGO,
                 sessions=3,
+                sessions_read=0,
                 mean_rules=0.0,
                 mean_notes=0.0,
                 mean_tokens=940.0,
@@ -254,7 +256,10 @@ def test_a_long_title_is_cut_and_later_entries_line_up_under_the_first() -> None
     second = lines[lines.index(first) + 1]
     assert f"{'R' * 57}..." in first
     assert len(long_title) > st.MAX_TITLE and "R" * 58 not in first
-    assert second == f"{' ' * st.LABEL_WIDTH}5h ago  rule  01a0ac4c  Short  [human]"
+    assert second == (
+        f"{' ' * st.LABEL_WIDTH}5h ago  rule"
+        "  01a0ac4c-9ad9-75f9-9819-2cca6840d457  demo  Short  [human]"
+    )
 
 
 def test_nothing_written_yet_says_so() -> None:
@@ -305,6 +310,7 @@ def test_a_percentage_floors_without_paying_for_binary_float_error() -> None:
             summary=InjectionSummary(
                 first_at=WEEK_AGO,
                 sessions=14,
+                sessions_read=11,
                 mean_rules=22.0,
                 mean_notes=8.0,
                 mean_tokens=4100.0,
@@ -358,10 +364,19 @@ def test_an_unavailable_section_says_why_and_the_rest_render() -> None:
     assert _line(lines, "store")
 
 
-def test_recent_lists_age_kind_id_prefix_and_title() -> None:
+def test_recent_lists_age_kind_the_whole_id_the_project_and_the_title() -> None:
+    """The id is a handle, and the project says which store it came from.
+
+    `cli._entry_id` parses a full UUID and refuses a prefix, and uuid7 is
+    time-ordered, so an eight-character prefix is neither unique across a
+    batch nor accepted by any command - it invited a reader to type it and
+    fail. `recent_entries` is owner-wide, so the project is what explains a
+    list of ten chunks from a file in another project.
+    """
     lines = st.render(_stats())
     assert _line(lines, "recent") == (
-        "recent    2m ago  note  01a0ac4c  Reranker follow-up  [agent]"
+        "recent    2m ago  note  01a0ac4c-9ad9-75f9-9819-2cca6840d456"
+        "  demo  Reranker follow-up  [agent]"
     )
 
 
@@ -390,3 +405,83 @@ def test_to_dict_has_the_same_keys_whether_or_not_sections_are_available() -> No
     assert full.keys() == broken.keys()
     assert broken["vectors"] is None
     assert broken["unavailable"]["vectors"] == "x"
+
+
+@pytest.mark.parametrize(
+    ("window", "want"),
+    [
+        (timedelta(days=7), "7d"),
+        (timedelta(hours=6), "6h"),
+        (timedelta(hours=36), "36h"),  # not the "1d" that window.days gives
+        (timedelta(hours=24), "1d"),
+        (timedelta(minutes=90), "90m"),
+    ],
+)
+def test_the_window_phrase_is_the_unit_the_window_actually_divides_into(
+    window: timedelta, want: str
+) -> None:
+    assert st._window_phrase(window) == want
+
+
+def test_the_extract_line_names_the_same_window_the_recall_line_does() -> None:
+    """One phrase, one function.
+
+    `--window 6h` rendered `extract ... 0d +N entries` while the recall
+    line correctly said `6h`, because this line printed `window.days` raw.
+    """
+    s = _stats(window=timedelta(hours=6))
+    assert "6h +12 entries (sonnet)" in _line(st.render(s), "extract")
+    assert "0d" not in _line(st.render(s), "extract")
+
+
+def test_an_awaiting_count_that_hit_its_limit_says_so() -> None:
+    """A capped count printed bare reports a backlog of thousands as 25."""
+    s = _stats(
+        extraction=st.Extraction(
+            jobs={"done": 43}, awaiting=25, extracted=12, model="sonnet", capped=True
+        )
+    )
+    assert "25+ waiting" in _line(st.render(s), "extract")
+
+
+def test_the_session_ratio_is_drawn_from_the_injected_population() -> None:
+    """Numerator and denominator both come from `injection_log`.
+
+    The numerator used to be distinct `access_log` session ids, a different
+    population: a cursor or opencode read carries no session id at all, so
+    it could never enter the numerator while `bag hook context` still wrote
+    an injection row into the denominator - and the pair could render
+    `1/0`.
+    """
+    line = _line(st.render(_stats()), "recall")
+    assert "48 reads in 11/14 sessions" in line
+
+
+def test_without_the_injection_section_there_is_no_ratio_to_draw() -> None:
+    line = _line(st.render(_stats(injection=st.Unavailable("x"))), "recall")
+    assert "48 reads in 11 sessions" in line
+
+
+def test_every_section_failing_the_same_way_renders_no_lines_at_all() -> None:
+    """A connection lost mid-collection is one problem, not seven.
+
+    The per-section savepoint exists so one failure costs one line; without
+    this guard the one failure mode that hits every section costs seven
+    copies of the same driver message, and the banner is meant to fall back
+    to its single line.
+    """
+    dead = {
+        name: st.Unavailable("OperationalError: connection lost")
+        for name in st.SECTIONS
+    }
+    s = _stats(**dead)
+    assert st.render(s) == []
+    assert st.collapsed_line(s) == (
+        "stats     unavailable (OperationalError: connection lost)"
+    )
+
+
+def test_sections_failing_for_different_reasons_still_each_say_why() -> None:
+    s = _stats(vectors=st.Unavailable("a"), recent=st.Unavailable("b"))
+    assert st.total_failure(s) is None
+    assert len(st.render(s)) >= len(st.SECTIONS)

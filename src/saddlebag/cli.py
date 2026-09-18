@@ -514,7 +514,14 @@ def stats(
     if as_json:
         typer.echo(json.dumps(stats_svc.to_dict(got), indent=2))
         return
-    for line in stats_svc.render(got):
+    lines = stats_svc.render(got)
+    if not lines:
+        # Every section failed the same way, so `render` collapsed them -
+        # the banner wants silence there, but a person typed this one and
+        # must not get an empty screen and a zero exit.
+        typer.echo(stats_svc.collapsed_line(got))
+        return
+    for line in lines:
         typer.echo(line)
 
 
