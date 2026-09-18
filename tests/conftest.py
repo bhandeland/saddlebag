@@ -160,9 +160,13 @@ def _reset_live_db(request: pytest.FixtureRequest) -> Iterator[None]:
                 # A future migration that dropped that FK would silently
                 # break isolation between tests with no test going red, so
                 # if one of these tables ever stops cascading, add it here
-                # explicitly rather than assuming it still does.
-                "truncate collection_members, collections, entry_events, "
-                "events, extract_jobs, record_settings, entries, principals "
+                # explicitly rather than assuming it still does. access_log
+                # and injection_log are named explicitly for the same reason
+                # as the others in this list, although they too cascade from
+                # `principals`.
+                "truncate access_log, injection_log, collection_members, "
+                "collections, entry_events, events, extract_jobs, "
+                "record_settings, entries, principals "
                 "restart identity cascade"
             )
     yield

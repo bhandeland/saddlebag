@@ -574,3 +574,45 @@ class SessionRef:
     event_count: int
     last_event_at: datetime
     extract_from: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AccessRecord:
+    """One read of the store by a frontend - see 026_usage_logs.sql.
+
+    `query_len`, never the query: these rows sit outside the record opt-in
+    precisely because they carry no content.
+    """
+
+    owner_id: UUID
+    source: str
+    op: str
+    hits: int
+    entry_ids: tuple[UUID, ...]
+    elapsed_ms: int
+    project: str | None = None
+    session_id: str | None = None
+    query_len: int | None = None
+    tier: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class InjectionRecord:
+    """One session start that reached the database."""
+
+    owner_id: UUID
+    project: str
+    harness: str
+    session_id: str | None
+    found: bool
+    rules: int
+    notes: int
+    chars: int
+    budget_chars: int
+    entry_ids: tuple[UUID, ...]
+
+    @property
+    def tokens_est(self) -> int:
+        # Four characters a token is the usual rough figure for English
+        # prose. Labelled an estimate everywhere it is shown.
+        return self.chars // 4

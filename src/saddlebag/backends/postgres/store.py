@@ -14,6 +14,7 @@ from psycopg.types.json import Jsonb
 
 from saddlebag.backends.postgres.sqltext import as_sql
 from saddlebag.domain import (
+    AccessRecord,
     Collection,
     CollectionQuery,
     DuplicateGroup,
@@ -27,6 +28,7 @@ from saddlebag.domain import (
     IngestDesignation,
     IngestRun,
     IngestTrigger,
+    InjectionRecord,
     JobStatus,
     Kind,
     Match,
@@ -2235,6 +2237,52 @@ class PostgresStore:
                 (name, str(owner_id)),
             )
             return bool(_one(cur)["pg_try_advisory_lock"])
+
+    # ---------------- usage ----------------
+
+    def log_access(self, record: AccessRecord) -> None:
+        with self._cur() as cur:
+            cur.execute(
+                "insert into access_log (id, owner_id, project, session_id, "
+                "source, op, query_len, tier, hits, entry_ids, elapsed_ms) "
+                "values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    new_id(),
+                    record.owner_id,
+                    record.project,
+                    record.session_id,
+                    record.source,
+                    record.op,
+                    record.query_len,
+                    record.tier,
+                    record.hits,
+                    list(record.entry_ids),
+                    record.elapsed_ms,
+                ),
+            )
+
+    def log_injection(self, record: InjectionRecord) -> None:
+        with self._cur() as cur:
+            cur.execute(
+                "insert into injection_log (id, owner_id, project, harness, "
+                "session_id, found, rules, notes, chars, tokens_est, "
+                "budget_chars, entry_ids) "
+                "values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    new_id(),
+                    record.owner_id,
+                    record.project,
+                    record.harness,
+                    record.session_id,
+                    record.found,
+                    record.rules,
+                    record.notes,
+                    record.chars,
+                    record.tokens_est,
+                    record.budget_chars,
+                    list(record.entry_ids),
+                ),
+            )
 
     def transaction(self) -> AbstractContextManager[Any]:
         # psycopg's own transaction() already does exactly what the

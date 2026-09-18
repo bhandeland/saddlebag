@@ -9,6 +9,7 @@ from typing import Any, Protocol
 from uuid import UUID
 
 from saddlebag.domain import (
+    AccessRecord,
     Collection,
     DuplicateGroup,
     DuplicateSet,
@@ -20,6 +21,7 @@ from saddlebag.domain import (
     IngestDesignation,
     IngestRun,
     IngestTrigger,
+    InjectionRecord,
     JobStatus,
     MemoryDesignation,
     MemoryRun,
@@ -406,6 +408,11 @@ class Store(Protocol):
         self, owner_id: UUID, limit: int = 5
     ) -> list[ExtractJob]: ...
     def try_advisory_lock(self, name: str, owner_id: UUID) -> bool: ...
+
+    # usage (026) - metadata only; see services/usage.py for the fail-soft
+    # wrapper every caller goes through.
+    def log_access(self, record: AccessRecord) -> None: ...
+    def log_injection(self, record: InjectionRecord) -> None: ...
 
     #: `Any`, not `None`: what the context manager yields is deliberately
     #: not part of this contract - callers use a bare `with` and never bind
