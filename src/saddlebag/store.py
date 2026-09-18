@@ -10,10 +10,12 @@ from uuid import UUID
 
 from saddlebag.domain import (
     AccessRecord,
+    AccessSummary,
     Collection,
     DuplicateGroup,
     DuplicateSet,
     Entry,
+    EntryCounts,
     Event,
     ExtractJob,
     HarnessStats,
@@ -22,11 +24,13 @@ from saddlebag.domain import (
     IngestRun,
     IngestTrigger,
     InjectionRecord,
+    InjectionSummary,
     JobStatus,
     MemoryDesignation,
     MemoryRun,
     MemoryTrigger,
     NearPair,
+    PipelineCounts,
     Principal,
     Query,
     SessionRef,
@@ -413,6 +417,20 @@ class Store(Protocol):
     # wrapper every caller goes through.
     def log_access(self, record: AccessRecord) -> None: ...
     def log_injection(self, record: InjectionRecord) -> None: ...
+
+    # usage reads - see services/stats.py, the only consumer of these.
+    def entry_counts(self, owner_id: UUID, project: str | None) -> EntryCounts: ...
+    def access_summary(
+        self, owner_id: UUID, since: datetime, project: str | None
+    ) -> AccessSummary: ...
+    def injection_summary(
+        self, owner_id: UUID, since: datetime, project: str | None
+    ) -> InjectionSummary: ...
+    #: Newest `created_at` first, live and superseded alike, every origin -
+    #: it is "what was written", not "what a context block would show".
+    def recent_entries(self, owner_id: UUID, limit: int) -> list[Entry]: ...
+    #: Runs are the newest across all projects for this owner.
+    def pipeline_counts(self, owner_id: UUID, since: datetime) -> PipelineCounts: ...
 
     #: `Any`, not `None`: what the context manager yields is deliberately
     #: not part of this contract - callers use a bare `with` and never bind

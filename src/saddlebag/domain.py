@@ -616,3 +616,56 @@ class InjectionRecord:
         # Four characters a token is the usual rough figure for English
         # prose. Labelled an estimate everywhere it is shown.
         return self.chars // 4
+
+
+@dataclass(frozen=True, slots=True)
+class EntryCounts:
+    """What `bag stats` shows about the entries table itself."""
+
+    live: int
+    project_live: int
+    by_kind: dict[str, int]
+    by_origin: dict[str, int]
+    superseded: int
+    collections: int
+    projects: int
+
+
+@dataclass(frozen=True, slots=True)
+class AccessSummary:
+    """A window of `access_log` rows, aggregated for `bag stats`."""
+
+    first_at: datetime | None  # earliest access_log row ever, for "since"
+    reads: int
+    by_source: dict[str, int]
+    by_op: dict[str, int]
+    searches: int
+    search_hits: int  # searches with hits > 0
+    tiers: dict[str, int]  # searches only, tier -> count, incl. "none"
+    p50_ms: int | None
+    sessions: int  # distinct non-null session ids that read
+
+
+@dataclass(frozen=True, slots=True)
+class InjectionSummary:
+    """A window of `injection_log` rows, plus the follow-through join."""
+
+    first_at: datetime | None
+    sessions: int
+    mean_rules: float
+    mean_notes: float
+    mean_tokens: float
+    injected: int  # sum of cardinality(entry_ids) over sessions with an id
+    opened: int  # of those, opened later in the same session
+
+
+@dataclass(frozen=True, slots=True)
+class PipelineCounts:
+    """The transcript/memory/ingest/extraction pipelines, for `bag stats`."""
+
+    transcript_sessions: int
+    transcript_subagents: int
+    last_transcript_run: TranscriptRun | None
+    last_memory_run: MemoryRun | None
+    last_ingest_run: IngestRun | None
+    extracted_since: int

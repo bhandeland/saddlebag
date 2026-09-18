@@ -15,11 +15,13 @@ from psycopg.types.json import Jsonb
 from saddlebag.backends.postgres.sqltext import as_sql
 from saddlebag.domain import (
     AccessRecord,
+    AccessSummary,
     Collection,
     CollectionQuery,
     DuplicateGroup,
     DuplicateSet,
     Entry,
+    EntryCounts,
     Event,
     EventKind,
     ExtractJob,
@@ -29,6 +31,7 @@ from saddlebag.domain import (
     IngestRun,
     IngestTrigger,
     InjectionRecord,
+    InjectionSummary,
     JobStatus,
     Kind,
     Match,
@@ -37,6 +40,7 @@ from saddlebag.domain import (
     MemoryTrigger,
     NearPair,
     Origin,
+    PipelineCounts,
     Principal,
     PrincipalKind,
     Query,
@@ -2283,6 +2287,210 @@ class PostgresStore:
                     list(record.entry_ids),
                 ),
             )
+
+    def entry_counts(self, owner_id: UUID, project: str | None) -> EntryCounts:
+        with self._cur() as cur:
+            cur.execute(
+                """
+                select
+                  count(*) filter (where superseded_by is null) as live,
+                  count(*) filter (where superseded_by is null
+                                   and project = %(project)s) as project_live,
+                  count(*) filter (where superseded_by is not null) as superseded,
+                  count(distinct project) filter (where superseded_by is null)
+                    as projects,
+                  (select count(*) from collections where owner_id = %(owner)s)
+                    as collections
+                from entries where owner_id = %(owner)s
+                """,
+                {"owner": owner_id, "project": project},
+            )
+            head = _one(cur)
+            cur.execute(
+                "select kind::text as k, count(*) as n from entries "
+                "where owner_id = %s and superseded_by is null group by 1",
+                (owner_id,),
+            )
+            kinds = {r["k"]: int(r["n"]) for r in cur.fetchall()}
+            cur.execute(
+                "select origin::text as k, count(*) as n from entries "
+                "where owner_id = %s and superseded_by is null group by 1",
+                (owner_id,),
+            )
+            origins = {r["k"]: int(r["n"]) for r in cur.fetchall()}
+        return EntryCounts(
+            live=int(head["live"]),
+            project_live=int(head["project_live"]),
+            by_kind=kinds,
+            by_origin=origins,
+            superseded=int(head["superseded"]),
+            collections=int(head["collections"]),
+            projects=int(head["projects"]),
+        )
+
+    def access_summary(
+        self, owner_id: UUID, since: datetime, project: str | None
+    ) -> AccessSummary:
+        # `project is null` in the parameter means "every project". Written as
+        # one predicate rather than two SQL strings so the owner filter exists
+        # exactly once.
+        scope = (
+            "owner_id = %(owner)s and at >= %(since)s "
+            "and (%(project)s::text is null or project = %(project)s)"
+        )
+        args = {"owner": owner_id, "since": since, "project": project}
+        with self._cur() as cur:
+            cur.execute(
+                as_sql(f"""
+                select
+                  count(*) as reads,
+                  count(*) filter (where op = 'search') as searches,
+                  count(*) filter (where op = 'search' and hits > 0) as search_hits,
+                  percentile_cont(0.5) within group (order by elapsed_ms) as p50,
+                  count(distinct session_id) as sessions,
+                  (select min(at) from access_log where owner_id = %(owner)s)
+                    as first_at
+                from access_log where {scope}
+                """),
+                args,
+            )
+            head = _one(cur)
+            by: dict[str, dict[str, int]] = {}
+            # `column` is interpolated from this literal tuple, not from
+            # anything derived - a module constant in spirit, the same
+            # exemption `as_sql`'s own docstring describes.
+            for column in ("source", "op", "tier"):
+                cur.execute(
+                    as_sql(f"""
+                    select {column} as k, count(*) as n from access_log
+                     where {scope} and {column} is not null group by 1
+                    """),
+                    args,
+                )
+                by[column] = {r["k"]: int(r["n"]) for r in cur.fetchall()}
+        return AccessSummary(
+            first_at=head["first_at"],
+            reads=int(head["reads"]),
+            by_source=by["source"],
+            by_op=by["op"],
+            searches=int(head["searches"]),
+            search_hits=int(head["search_hits"]),
+            tiers=by["tier"],
+            p50_ms=None if head["p50"] is None else round(head["p50"]),
+            sessions=int(head["sessions"]),
+        )
+
+    def injection_summary(
+        self, owner_id: UUID, since: datetime, project: str | None
+    ) -> InjectionSummary:
+        with self._cur() as cur:
+            cur.execute(
+                """
+                with inj as (
+                  select * from injection_log
+                   where owner_id = %(owner)s and at >= %(since)s
+                     and (%(project)s::text is null or project = %(project)s)
+                ),
+                ids as (
+                  select i.session_id, i.at, u.id as entry_id
+                    from inj i, unnest(i.entry_ids) as u(id)
+                   where i.session_id is not null
+                )
+                select
+                  (select count(*) from inj) as sessions,
+                  (select avg(rules) from inj) as mean_rules,
+                  (select avg(notes) from inj) as mean_notes,
+                  (select avg(tokens_est) from inj) as mean_tokens,
+                  (select count(*) from ids) as injected,
+                  -- A `search` row whose hits include the injected id also
+                  -- counts as "opened": a recall that surfaces the entry
+                  -- again is the same follow-through as a direct `get`.
+                  (select count(*) from ids
+                    where exists (
+                      select 1 from access_log a
+                       where a.owner_id = %(owner)s
+                         and a.session_id = ids.session_id
+                         and a.at >= ids.at
+                         and ids.entry_id = any(a.entry_ids))) as opened,
+                  (select min(at) from injection_log where owner_id = %(owner)s)
+                    as first_at
+                """,
+                {"owner": owner_id, "since": since, "project": project},
+            )
+            row = _one(cur)
+        return InjectionSummary(
+            first_at=row["first_at"],
+            sessions=int(row["sessions"]),
+            mean_rules=float(row["mean_rules"] or 0),
+            mean_notes=float(row["mean_notes"] or 0),
+            mean_tokens=float(row["mean_tokens"] or 0),
+            injected=int(row["injected"]),
+            opened=int(row["opened"]),
+        )
+
+    def recent_entries(self, owner_id: UUID, limit: int) -> list[Entry]:
+        with self._cur() as cur:
+            cur.execute(
+                as_sql(f"""
+                select {entry_columns()} from entries
+                 where owner_id = %s
+                 order by created_at desc, id desc
+                 limit %s
+                """),
+                (owner_id, limit),
+            )
+            return [_row_to_entry(r) for r in cur.fetchall()]
+
+    def pipeline_counts(self, owner_id: UUID, since: datetime) -> PipelineCounts:
+        with self._cur() as cur:
+            cur.execute(
+                """
+                select
+                  count(*) filter (where agent_id is null) as sessions,
+                  count(*) filter (where agent_id is not null) as subagents
+                from transcripts where owner_id = %s
+                """,
+                (owner_id,),
+            )
+            t = _one(cur)
+            cur.execute(
+                "select count(*) as n from entries where owner_id = %s "
+                "and origin = 'extracted' and created_at >= %s",
+                (owner_id, since),
+            )
+            extracted = int(_one(cur)["n"])
+            cur.execute(
+                as_sql(f"""
+                select {transcript_run_columns()} from transcript_runs
+                 where owner_id = %s order by started_at desc limit 1
+                """),
+                (owner_id,),
+            )
+            tr = cur.fetchone()
+            cur.execute(
+                as_sql(f"""
+                select {memory_run_columns()} from memory_runs
+                 where owner_id = %s order by started_at desc limit 1
+                """),
+                (owner_id,),
+            )
+            mr = cur.fetchone()
+            cur.execute(
+                as_sql(f"""
+                select {ingest_run_columns()} from ingest_runs
+                 where owner_id = %s order by started_at desc limit 1
+                """),
+                (owner_id,),
+            )
+            ir = cur.fetchone()
+        return PipelineCounts(
+            transcript_sessions=int(t["sessions"]),
+            transcript_subagents=int(t["subagents"]),
+            last_transcript_run=_row_to_transcript_run(tr) if tr else None,
+            last_memory_run=_row_to_memory_run(mr) if mr else None,
+            last_ingest_run=_row_to_ingest_run(ir) if ir else None,
+            extracted_since=extracted,
+        )
 
     def transaction(self) -> AbstractContextManager[Any]:
         # psycopg's own transaction() already does exactly what the
