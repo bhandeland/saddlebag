@@ -5,6 +5,7 @@ text is the only thing steering agent behaviour."""
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 from uuid import UUID
 
@@ -16,9 +17,9 @@ from uuid import UUID
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 
-from saddlebag.domain import Kind, Origin, Query
+from saddlebag.domain import AccessRecord, Kind, Origin, Query
 from saddlebag.project import resolve_project
-from saddlebag.services import kb, write
+from saddlebag.services import kb, usage, write
 from saddlebag.services.search import find
 from saddlebag.session import open_session
 
@@ -61,14 +62,16 @@ def _default_project() -> str | None:
 
 
 def _session_id() -> str | None:
-    # MCP tool calls carry no session id; use one only if the environment
-    # supplies it. Recording null is better than fabricating a value.
+    # Claude Code sets CLAUDE_CODE_SESSION_ID in the server's environment -
+    # see usage.SESSION_ENV. The server is started once per Claude Code
+    # process, so after /clear this is the id the process started with, not
+    # the new one; still the right session far more often than null is.
     #
     # Over HTTP the environment is the launcher's, not the agent's, so the
     # variable is not merely absent but wrong. Same argument, stronger case.
     if _http_mode:
         return None
-    return os.environ.get("CLAUDE_SESSION_ID")
+    return usage.session_id_from_env(os.environ)
 
 
 def _invalid_kind_message(kind: str) -> str:
@@ -198,6 +201,9 @@ def recall_tool(
             include_archived=include_archived,
             semantic_threshold=s.config.semantic_threshold,
             embed_model=s.config.embed_model,
+            source="mcp",
+            session_id=_session_id(),
+            log_project=_default_project(),
         )
         return [
             {
@@ -220,10 +226,27 @@ def get_entry_tool(entry_id: str) -> dict[str, Any]:
     Use when a recall snippet looks relevant and you need the whole text.
     """
     with open_session() as s:
+        started = time.perf_counter()
         try:
-            entry = s.store.get_entry(UUID(entry_id), s.owner.id)
+            parsed = UUID(entry_id)
         except ValueError:
+            # Never reached the store, so there is nothing to log - an
+            # invalid id is a malformed call, not a read.
             return {"error": f"'{entry_id}' is not a valid entry id"}
+        entry = s.store.get_entry(parsed, s.owner.id)
+        usage.log_access(
+            s.store,
+            AccessRecord(
+                owner_id=s.owner.id,
+                source="mcp",
+                op="get",
+                hits=0 if entry is None else 1,
+                entry_ids=() if entry is None else (entry.id,),
+                elapsed_ms=usage.elapsed_ms(started),
+                project=_default_project(),
+                session_id=_session_id(),
+            ),
+        )
         if entry is None:
             return {"error": f"no entry {entry_id}"}
         return {

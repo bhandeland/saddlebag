@@ -40,7 +40,7 @@ def test_stdio_reports_the_session_id_from_the_environment(
 ) -> None:
     from saddlebag import mcp_server
 
-    monkeypatch.setenv("CLAUDE_SESSION_ID", "abc123")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "abc123")
     assert mcp_server._session_id() == "abc123"
 
 
@@ -52,7 +52,7 @@ def test_http_reports_no_session_id_even_when_the_environment_sets_one(
     # merely absent. Recording null is the honest answer.
     from saddlebag import mcp_server
 
-    monkeypatch.setenv("CLAUDE_SESSION_ID", "the-launchers-session")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "the-launchers-session")
     mcp_server.configure(http=True)
     assert mcp_server._session_id() is None
 

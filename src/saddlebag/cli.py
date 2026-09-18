@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from functools import partial
@@ -25,6 +26,7 @@ from saddlebag.backends.postgres.migrate import (
 )
 from saddlebag.config import load
 from saddlebag.domain import (
+    AccessRecord,
     CollectionQuery,
     Entry,
     Kind,
@@ -38,7 +40,7 @@ from saddlebag.embed import EmbedderUnavailable, load_embedder
 from saddlebag.importers import claude_mem
 from saddlebag.project import repo_root, resolve_project, toplevel
 from saddlebag.services import dedupe as dedupe_service
-from saddlebag.services import import_, kb, write
+from saddlebag.services import import_, kb, usage, write
 from saddlebag.services import ingest as ingest_service
 from saddlebag.services import memory as memory_service
 from saddlebag.services import transcripts as transcripts_service
@@ -435,6 +437,9 @@ def search(
             include_archived=archived,
             semantic_threshold=s.config.semantic_threshold,
             embed_model=s.config.embed_model,
+            source="cli",
+            session_id=usage.session_id_from_env(os.environ),
+            log_project=_default_project(),
         )
     if as_json:
         payload = []
@@ -516,7 +521,21 @@ def get(
     """Print one entry in full."""
     parsed = _entry_id(entry_id)
     with _session() as s:
+        started = time.perf_counter()
         entry = s.store.get_entry(parsed, s.owner.id)
+        usage.log_access(
+            s.store,
+            AccessRecord(
+                owner_id=s.owner.id,
+                source="cli",
+                op="get",
+                hits=0 if entry is None else 1,
+                entry_ids=() if entry is None else (entry.id,),
+                elapsed_ms=usage.elapsed_ms(started),
+                project=_default_project(),
+                session_id=usage.session_id_from_env(os.environ),
+            ),
+        )
     if entry is None:
         typer.echo(f"No entry {entry_id}", err=True)
         raise typer.Exit(1)
@@ -1756,11 +1775,25 @@ def handoff_latest(
         typer.echo("No handoff stored for this directory.")
         return
     with _session() as s:
+        started = time.perf_counter()
         try:
             entry = handoff_svc.latest(s.store, s.owner.id, project=name, topic=topic)
         except ValueError as exc:
             typer.echo(str(exc), err=True)
             raise typer.Exit(1)
+        usage.log_access(
+            s.store,
+            AccessRecord(
+                owner_id=s.owner.id,
+                source="cli",
+                op="handoff",
+                hits=0 if entry is None else 1,
+                entry_ids=() if entry is None else (entry.id,),
+                elapsed_ms=usage.elapsed_ms(started),
+                project=name,
+                session_id=usage.session_id_from_env(os.environ),
+            ),
+        )
     if entry is None:
         # An ordinary state, not an error: most projects have never been
         # handed off, and prime asks about them anyway.
