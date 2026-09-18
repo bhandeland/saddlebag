@@ -1,3 +1,4 @@
+import contextlib
 from typing import Any, override
 from uuid import UUID
 
@@ -86,6 +87,12 @@ class StubStore:
     def fuzzy_search(self, query: Query, owner_id: UUID, threshold: float) -> list[Hit]:
         self.called.append("fuzzy")
         return list(self._fuzzy)
+
+    def log_access(self, record: Any) -> None:
+        pass
+
+    def transaction(self) -> Any:
+        return contextlib.nullcontext()
 
 
 class StubEmbedder:

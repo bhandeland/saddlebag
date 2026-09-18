@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import time
+from contextlib import AbstractContextManager
 from dataclasses import replace
-from typing import Final, Protocol, final
+from typing import Any, Final, Protocol, final
 from uuid import UUID
 
 from saddlebag.config import DEFAULT_FUZZY_THRESHOLD, DEFAULT_SEMANTIC_THRESHOLD
-from saddlebag.domain import Hit, Origin, Query
+from saddlebag.domain import AccessRecord, Hit, Origin, Query
 from saddlebag.embed import (
     DEFAULT_EMBED_MODEL,
     Embedder,
@@ -15,6 +17,7 @@ from saddlebag.embed import (
     load_embedder,
     query_text,
 )
+from saddlebag.services import usage
 
 MAX_LIMIT = 200
 
@@ -43,6 +46,8 @@ class SearchStore(Protocol):
     def fuzzy_search(
         self, query: Query, owner_id: UUID, threshold: float
     ) -> list[Hit]: ...
+    def log_access(self, record: AccessRecord) -> None: ...
+    def transaction(self) -> AbstractContextManager[Any]: ...
 
 
 #: What a search returns when the caller did not ask for specific origins.
@@ -155,6 +160,9 @@ def find(
     embedder: Embedder | None | _Unspecified = _UNSPECIFIED,
     semantic_threshold: float = DEFAULT_SEMANTIC_THRESHOLD,
     embed_model: str = DEFAULT_EMBED_MODEL,
+    source: str | None = None,
+    session_id: str | None = None,
+    log_project: str | None = None,
 ) -> list[Hit]:
     """Three tiers, each running only when the one above returned nothing.
 
@@ -193,6 +201,11 @@ def find(
     Handoffs and archived document chunks are excluded from the default
     origins unless `include_handoffs` / `include_archived` is set, or the
     caller already named specific origins.
+
+    `source` turns on usage logging (`services/usage`); None - every test,
+    the eval script, every internal caller - logs nothing. `log_project` is
+    the project the frontend resolved for the log row, which is not
+    `query.project`: a search usually has no project filter.
     """
     if query.limit <= 0:
         return []
@@ -208,20 +221,39 @@ def find(
         query = replace(query, origins=origins)
     query = _clamped(query)
 
-    hits = store.search(query, owner_id)
+    started = time.perf_counter()
     text = (query.text or "").strip()
-    if hits or not text:
+    hits = store.search(query, owner_id)
+    if not hits and text:
         # No text means a listing query - filters only. There is nothing for
-        # the fallbacks to be approximately like.
-        return hits
+        # the fallbacks to be approximately like, so an empty exact result
+        # only falls through to semantic/trigram when there was a query to
+        # retry.
+        hits = _semantic(
+            store, owner_id, query, text, embedder, semantic_threshold, embed_model
+        )
+        if not hits:
+            hits = store.fuzzy_search(query, owner_id, fuzzy_threshold)
 
-    hits = _semantic(
-        store, owner_id, query, text, embedder, semantic_threshold, embed_model
-    )
-    if hits:
-        return hits
-
-    return store.fuzzy_search(query, owner_id, fuzzy_threshold)
+    if source is not None:
+        usage.log_access(
+            store,
+            AccessRecord(
+                owner_id=owner_id,
+                source=source,
+                op="search",
+                hits=len(hits),
+                entry_ids=tuple(h.entry.id for h in hits),
+                elapsed_ms=usage.elapsed_ms(started),
+                project=log_project,
+                session_id=session_id,
+                # A listing query (no text) has neither a length nor a tier:
+                # nothing was matched, only filtered.
+                query_len=len(text) if text else None,
+                tier=(str(hits[0].match) if hits else "none") if text else None,
+            ),
+        )
+    return hits
 
 
 def _semantic(
