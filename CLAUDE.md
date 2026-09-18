@@ -1296,7 +1296,62 @@ exits non-zero for an unreachable database - a person typed it and deserves
 to know - but exits **0** with an `unavailable (...)` line for a section
 that could not answer, the rule `bag doctor` follows for `UNCHECKED`:
 exiting non-zero for "I could not tell" trains people to ignore the exit
-code.
+code. Two consequences of that savepoint worth knowing before writing a
+third caller. The `set local statement_timeout` **outlives the savepoint**
+- `set local` lasts until the enclosing *transaction* ends - so it caps
+every later statement in that transaction including the caller's own:
+**collect last**. Both callers today do, and nothing enforces it. And when
+**every** section comes back unavailable with the *same* reason - a
+connection lost between the injection and the collection is one problem,
+not seven - `render` returns no lines at all, so the banner is exactly
+today's single line; `bag stats` prints `stats.collapsed_line` instead,
+because a person typed that one and an empty screen with a zero exit is
+not an answer.
+
+**A session is not a row, and the two halves of a ratio come from one
+population.** Claude Code fires `SessionStart` on startup, resume, clear
+*and* compact, so one session writes several `injection_log` rows:
+`injection_summary` counts `distinct session_id` and dedupes the
+follow-through pairs per `(session, entry)`, or a user who compacts often
+reports several sessions and a follow-through dragged toward zero by their
+own `/compact`. The `N/M sessions` figure on the recall line is likewise
+**both** counted from `injection_log` - injected sessions that then read,
+out of injected sessions. Drawing the numerator from `access_log` instead
+compared two different populations: the CLI reads its session id from
+`CLAUDE_CODE_SESSION_ID`, which only Claude Code sets, so a cursor or
+opencode read carries no session at all and could never enter the
+numerator while `bag hook context` still wrote an injection row into the
+denominator - a permanent under-report for two of the three harnesses
+saddlebag targets, and a ratio that could render `1/0`. A session that read
+without being injected is outside the ratio entirely.
+
+**Five recorded columns are deliberately unread.** `access_log.query_len`
+and `injection_log.found`, `chars`, `budget_chars` and `harness` are
+written and never rendered, here or in `--json`. That is the same rule the
+rest of this file applies to capture - derived data lives apart from its
+source, and filtering at the recording boundary caps what any future
+reader could ever see - not an oversight, and adding a query for one of
+them needs no migration. `harness` is the one worth naming, because the
+question it answers is a real one nobody has asked yet: **which harness is
+actually getting context**. `bag hook context` threads the agent name
+through precisely so cursor and opencode are distinguishable; the data is
+there and the query is missing. `source = 'hook'` is reserved in the same
+spirit - migration 026's check constraint allows it, nothing writes it
+today, and it is there for a read performed on a hook path (`bag hook
+context` writes an injection row, not an access row, so there is nothing
+to wire it to yet). An applied migration is never edited, so the value
+stays and this sentence is why.
+
+**The banner counts a smaller backlog than a typed command does.**
+`stats.collect` takes an `awaiting_limit`; `bag stats` and `bag record
+status` use `events.STATUS_AWAITING_LIMIT` (1000, justified for a command
+a person typed), and the SessionStart hook passes
+`stats.BANNER_AWAITING_LIMIT` (25). The cost is one aggregate over the
+never-pruned `events` table plus one `extract_job_for_session` round-trip
+per candidate, and the 1.5s `statement_timeout` is no backstop there - it
+bounds each statement, not a thousand of them. A banner line only has to
+say whether extraction is behind, and a count that hit its limit renders
+as `25+` rather than as a tidy twenty-five.
 
 **Percentages floor, they never round.** `_pct` reports 37 of 40 as 92%,
 not the 93% rounding would give it - every number saddlebag shows errs
