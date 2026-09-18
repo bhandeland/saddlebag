@@ -1003,6 +1003,11 @@ a session gets no context and was invisible before. `RulesExceedBudget` still
 raises before anything is known and stays silent here; `bag record status` is
 where that one shows.
 
+The banner also carries the `bag stats` lines, and they are **user-visible
+only**: they go to `systemMessage` and never to `additionalContext`, so the
+model pays no tokens for them and the block it receives is unchanged whether
+stats were collected or not. See "Usage statistics" below.
+
 The SessionStart hook injects the knowledge base whose slug is exactly the session
 directory's name. Writes, by contrast, resolve `--project` from the git repository root
 (`project.resolve_project`, via `--git-common-dir`) so subdirectories and worktrees file
@@ -1198,6 +1203,127 @@ demand, exactly as `record status` is for recording.
 - **Not in `bag doctor`**, deliberately: doctor reads files and opens no
   database so that it still works when the system does not, and this
   question cannot be answered without resolving a collection.
+
+### Usage statistics
+
+Two logs (migration 026) and one reader. `access_log` is one row per read a
+frontend performed - a `search`, a `get`, a `handoff` lookup - and
+`injection_log` is one row per session start that reached the database.
+`bag stats` and the SessionStart banner are what read them. The question
+they exist to answer is the one saddlebag could never answer about itself:
+whether anything it stores is ever retrieved, and whether the rules it
+injects into every session are ever acted on.
+
+**Both tables are metadata only, and that is load-bearing rather than
+tidy.** `access_log` stores the query's **length** and never its text;
+both tables store entry **ids** and never entry content. That is precisely
+why they can sit outside the per-project record opt-in that governs
+`events`. The opt-in in `services/record.py` exists because an event holds
+`tool_input` and `tool_response` - the user's actual work, in full, kept
+indefinitely. A row saying "a 23-character search ran, hit the exact tier,
+returned these four ids in 31ms" describes **saddlebag's** use, not the
+user's work, and gating it behind the same opt-in would have meant the
+statistics were blank on exactly the projects nobody had thought to
+configure. If a field is ever added here that carries content, that
+reasoning collapses and the opt-in question has to be re-asked - so do not
+add one casually.
+
+**Logging happens only when a frontend passes `source`.** `search.find`,
+the `get` path and the handoff read all take `source` defaulting to
+`None`, and `None` writes nothing. Tests, `scripts-eval-retrieval.py` and
+every internal caller therefore never appear in the numbers, which is what
+keeps a 165-question eval run from reading as a very productive Tuesday.
+The cost of that design is the usual one and it is stated here so nobody
+discovers it the hard way: **a new frontend that does not pass a `source`
+is invisible** - it works perfectly, logs nothing, and its users silently
+do not exist in `bag stats`. This is the same warning
+`search.DEFAULT_ORIGINS` carries three times in this file, for the same
+reason: an allowlist keeps the wrong thing out by keeping everything out,
+and the new thing is always the thing that was forgotten. Today the
+allowlist is `('cli', 'mcp', 'hook')`, checked in the migration, so at
+least a typo fails loudly rather than filing rows under a fourth source
+nothing renders.
+
+**Every log write is savepointed and fail-soft** (`services/usage.py`).
+Fail-soft is obvious - a search must never fail because its log row could
+not be written - but the savepoint is the part worth not removing. These
+writes happen **inside the caller's transaction**, so without
+`store.transaction()` wrapping them a failed insert leaves the connection
+in `InFailedSqlTransaction` and the statement that raises is not the log
+write at all: it is the **caller's next statement**, somewhere else
+entirely, with a message about a transaction being aborted. A
+try/except around the insert alone would catch the log's own failure and
+hand the damage to whoever ran next. Failures are explained to stderr
+behind `BAG_HOOK_DEBUG`, the same gate `hookio.debug` uses, and never to
+stdout - which may be the MCP protocol stream.
+
+**`CLAUDE_CODE_SESSION_ID` is the variable Claude Code actually sets**, in
+every process it starts - Bash tool calls and MCP servers alike.
+`mcp_server.py` read `CLAUDE_SESSION_ID`, which is never set by anything,
+so every entry written through an MCP `remember` before this change
+carries a null session id: 60 of them, measured 2026-09-16. The name lives
+once, as `usage.SESSION_ENV`, because the failure was silent in both
+directions - nothing errors when an environment variable is absent, and a
+null column looks like an ordinary optional field. Two caveats survive the
+fix. The MCP server is started **once per Claude Code process**, so after a
+`/clear` it still reports the id its process started with; that is still
+right far more often than null was, which is why it is kept rather than
+blanked. And over `--http` the environment belongs to whatever launched
+the server rather than to the agent calling the tool, so the id is not
+merely absent but **wrong** - `_session_id()` returns `None` there, the
+same reasoning that pins the project with `--project`.
+
+**Follow-through is a proxy, not a quality score.** The
+`injected`/`opened` figure joins the ids a session was handed against the
+ids that session later read, and a low number does not mean the rules were
+ignored: rules render as title plus summary, and **a rule obeyed from its
+summary is never opened** - that is the whole point of the short form (see
+"What the context block carries"). What it measures is how often the block
+was insufficient on its own. Read it as a signal about the summaries, not
+as a grade for the knowledge base, and do not tune anything to make the
+number go up.
+
+**Fail-soft per section in the hook, loud about the database in `bag
+stats`, and an unavailable section is never an exit code.** Each section in
+`stats.collect` runs inside its own savepoint with a 1.5s
+`statement_timeout`, so one slow or broken query costs **one line** and not
+the banner - the SessionStart hook has ten seconds for everything it does,
+and without the per-section savepoint the first failure aborts the
+transaction and takes every later section with it. `Unavailable(reason)` is
+a third state deliberately distinct from zero: a read count of zero and a
+read count nobody could measure are different statements. `bag stats`
+exits non-zero for an unreachable database - a person typed it and deserves
+to know - but exits **0** with an `unavailable (...)` line for a section
+that could not answer, the rule `bag doctor` follows for `UNCHECKED`:
+exiting non-zero for "I could not tell" trains people to ignore the exit
+code.
+
+**Percentages floor, they never round.** `_pct` reports 37 of 40 as 92%,
+not the 93% rounding would give it - every number saddlebag shows errs
+toward claiming less than it knows. The epsilon in `_pct` is the opposite
+case and is **not** a rounding fudge: a fraction arriving as a float - the
+budget does - can be 0.29, and `100 * 0.29` is 28.999999999999996 in binary
+floating point, which floors to 28% and is not conservative but wrong. The
+epsilon is far smaller than any difference a whole percent can show, so it
+corrects binary representation and nothing else. A test pins 0.29 rendering
+as 29% against anyone simplifying it away.
+
+**`since <date>` rather than a window that was never measured, and
+nothing is backfilled.** When the earliest logged row is younger than the
+window, the period reads `since 2026-09-16` instead of `7d`. These numbers
+begin when logging began - there is no history to reconstruct, because
+`entries` and `events` record what was written, never what was read - so a
+window spanning days that were not logged would report a quiet week that
+simply had no log. The first week after this ships looks sparse, and that
+is honest rather than broken.
+
+**Stats never reach `additionalContext`.** `render_output` passes the
+rendered lines only to `systemMessage`, via `context.banner`; the block the
+model receives is byte-identical whether or not stats were collected. The
+model pays no tokens for them, which is also why the lines are free to be
+this dense - they are for the person reading the banner. `context.py`
+takes rendered lines rather than a `Stats` and never imports
+`services.stats`, so it collects nothing on its own.
 
 ## Verification
 
