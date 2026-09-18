@@ -226,17 +226,24 @@ def handoff_pointer(live: Handoff | None) -> str:
     return f"Handoff available: {live.topic} ({live.age}) - run bag-prime {live.topic}"
 
 
-def banner(got: Injection) -> str:
-    """One line telling the user what this session was handed.
+def banner(got: Injection, stats_lines: list[str] | None = None) -> str:
+    """One line telling the user what this session was handed, plus
+    optional usage-statistics lines appended below it.
 
     Rendered from the facts, not parsed back out of the block, and here in
     the service so any frontend with a channel to a human prints the same
-    line. Claude Code shows it prefixed with `SessionStart:startup says:`,
-    which is why it is terse and why there is no version stamp.
+    line. Claude Code shows the first line prefixed with
+    `SessionStart:startup says:`, which is why it is terse and why there is
+    no version stamp.
 
     A missing knowledge base is the one state that gets more words: it is
     the likeliest reason a session gets no context, the hook has always
     swallowed it, and the fix is one command.
+
+    The stats lines are appended verbatim; they reach the user only -
+    `additionalContext` never carries them, so the model pays nothing.
+    `stats_lines` takes rendered lines rather than a `Stats`, so this
+    module never imports `services.stats` - it collects nothing on its own.
     """
     if not got.found:
         kb_part = f"no knowledge base '{got.project}' (bag kb new {got.project})"
@@ -253,7 +260,8 @@ def banner(got: Injection) -> str:
     ]
     if got.handoff is not None:
         parts.append(f"handoff: {got.handoff.topic} ({got.handoff.age})")
-    return " · ".join(parts)
+    head = " · ".join(parts)
+    return "\n".join([head, *(stats_lines or [])])
 
 
 def _count(n: int, noun: str) -> str:

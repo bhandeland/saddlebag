@@ -100,7 +100,7 @@ def test_injects_the_project_knowledge_base(
         )
         s.conn.commit()
 
-    out = session_start(
+    result = session_start(
         json.dumps({"cwd": str(project_dir), "session_id": "s1"}),
         env={
             "BAG_DSN": live_dsn,
@@ -108,8 +108,9 @@ def test_injects_the_project_knowledge_base(
             "BAG_CONFIG": str(tmp_path / "none.toml"),
         },
     )
-    assert out is not None
-    assert "Run ruff linter" in out.text
+    assert result is not None
+    got, _lines = result
+    assert "Run ruff linter" in got.text
 
     # The same session, through main(): what Claude Code actually reads. A
     # JSON document, because that is the only shape that carries both a
@@ -123,9 +124,151 @@ def test_injects_the_project_knowledge_base(
     doc = json.loads(capsys.readouterr().out)
     assert doc["hookSpecificOutput"]["hookEventName"] == "SessionStart"
     assert "Run ruff linter" in doc["hookSpecificOutput"]["additionalContext"]
-    assert (
-        doc["systemMessage"] == "saddlebag · kb myproj: 1 rule, 0 notes · recording off"
+    # Stats lines land only in systemMessage - the database is reachable
+    # here, so the banner may carry them after the first line.
+    assert doc["systemMessage"].startswith(
+        "saddlebag · kb myproj: 1 rule, 0 notes · recording off"
     )
+
+
+@pytest.mark.db
+def test_the_banner_carries_stats_and_the_model_pays_nothing_for_them(
+    live_dsn: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Stats reach only systemMessage - additionalContext is what the model
+    is billed for, and this feature must cost it nothing."""
+    import psycopg
+
+    from saddlebag.services import kb
+    from saddlebag.services.write import remember
+    from saddlebag.session import open_session
+
+    with psycopg.connect(live_dsn) as c:
+        migrate(c)
+        c.commit()
+
+    monkeypatch.setenv("BAG_DSN", live_dsn)
+    monkeypatch.setenv("BAG_USER_ID", "brandon")
+    monkeypatch.setenv("BAG_CONFIG", str(tmp_path / "none.toml"))
+
+    def no_spawn(env: Mapping[str, str]) -> bool:
+        return False
+
+    monkeypatch.setattr("saddlebag.agents.claude_code.hook.spawn_process", no_spawn)
+    monkeypatch.setattr("saddlebag.agents.claude_code.hook.spawn_ingest", no_spawn)
+    monkeypatch.setattr("saddlebag.agents.claude_code.hook.spawn_memory", no_spawn)
+    monkeypatch.setattr("saddlebag.agents.claude_code.hook.spawn_transcripts", no_spawn)
+
+    project_dir = tmp_path / "myproj"
+    project_dir.mkdir()
+
+    with open_session() as s:
+        from saddlebag.domain import CollectionQuery, Kind
+
+        kb.create(
+            s.store,
+            s.owner.id,
+            slug="myproj",
+            title="myproj",
+            query=CollectionQuery(project="myproj"),
+        )
+        remember(
+            s.store,
+            s.owner.id,
+            title="Lint rule",
+            body="always run ruff",
+            summary="Run ruff linter",
+            kind=Kind.RULE,
+            project="myproj",
+        )
+        s.conn.commit()
+
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(json.dumps({"cwd": str(project_dir), "session_id": "s1"})),
+    )
+    assert main() == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["systemMessage"].splitlines()[0].startswith("saddlebag · kb ")
+    assert any(line.startswith("store ") for line in doc["systemMessage"].splitlines())
+    # The model's context is untouched by stats.
+    assert "store " not in doc["hookSpecificOutput"]["additionalContext"]
+
+
+@pytest.mark.db
+def test_a_broken_stats_collection_leaves_exactly_todays_banner(
+    live_dsn: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Stats are a nicety on top of the injection - a failure inside
+    collection must cost the stats lines only, never the block or the
+    banner's first line, and additionalContext must be untouched."""
+    import psycopg
+
+    from saddlebag.services import kb
+    from saddlebag.services.write import remember
+    from saddlebag.session import open_session
+
+    with psycopg.connect(live_dsn) as c:
+        migrate(c)
+        c.commit()
+
+    monkeypatch.setenv("BAG_DSN", live_dsn)
+    monkeypatch.setenv("BAG_USER_ID", "brandon")
+    monkeypatch.setenv("BAG_CONFIG", str(tmp_path / "none.toml"))
+
+    def no_spawn(env: Mapping[str, str]) -> bool:
+        return False
+
+    monkeypatch.setattr("saddlebag.agents.claude_code.hook.spawn_process", no_spawn)
+    monkeypatch.setattr("saddlebag.agents.claude_code.hook.spawn_ingest", no_spawn)
+    monkeypatch.setattr("saddlebag.agents.claude_code.hook.spawn_memory", no_spawn)
+    monkeypatch.setattr("saddlebag.agents.claude_code.hook.spawn_transcripts", no_spawn)
+
+    project_dir = tmp_path / "myproj"
+    project_dir.mkdir()
+
+    with open_session() as s:
+        from saddlebag.domain import CollectionQuery, Kind
+
+        kb.create(
+            s.store,
+            s.owner.id,
+            slug="myproj",
+            title="myproj",
+            query=CollectionQuery(project="myproj"),
+        )
+        remember(
+            s.store,
+            s.owner.id,
+            title="Lint rule",
+            body="always run ruff",
+            summary="Run ruff linter",
+            kind=Kind.RULE,
+            project="myproj",
+        )
+        s.conn.commit()
+
+    def boom(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("stats exploded")
+
+    monkeypatch.setattr("saddlebag.services.stats.collect", boom)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(json.dumps({"cwd": str(project_dir), "session_id": "s1"})),
+    )
+    assert main() == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["systemMessage"] == (
+        "saddlebag · kb myproj: 1 rule, 0 notes · recording off"
+    )
+    assert "\n" not in doc["systemMessage"]
+    assert "Run ruff linter" in doc["hookSpecificOutput"]["additionalContext"]
 
 
 @pytest.mark.db
@@ -150,12 +293,13 @@ def test_returns_empty_when_the_project_has_no_knowledge_base(
         "BAG_USER_ID": "brandon",
         "BAG_CONFIG": str(tmp_path / "none.toml"),
     }
-    out = session_start(json.dumps({"cwd": str(tmp_path / "unknown-proj")}), env=env)
+    result = session_start(json.dumps({"cwd": str(tmp_path / "unknown-proj")}), env=env)
     # No block for the model - but the database answered, so the user gets
     # a banner saying which knowledge base was looked for and not found.
-    assert out is not None
-    assert out.text == ""
-    assert out.found is False
+    assert result is not None
+    got, _lines = result
+    assert got.text == ""
+    assert got.found is False
 
 
 def test_debug_is_silent_unless_asked_for(capsys: pytest.CaptureFixture[str]) -> None:
@@ -235,9 +379,11 @@ def test_debug_names_the_missing_knowledge_base(
         "BAG_CONFIG": str(tmp_path / "none.toml"),
         "BAG_HOOK_DEBUG": "1",
     }
-    out = session_start(json.dumps({"cwd": str(tmp_path / "unknown-proj")}), env=env)
+    result = session_start(json.dumps({"cwd": str(tmp_path / "unknown-proj")}), env=env)
     err = capsys.readouterr().err
-    assert out is not None and out.text == ""
+    assert result is not None
+    got, _lines = result
+    assert got.text == ""
     assert "unknown-proj" in err
 
 

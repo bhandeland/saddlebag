@@ -65,3 +65,16 @@ def test_the_banner_is_one_line() -> None:
         injection(rules=1, notes=1, recording=True, handoff=Handoff("t", "2d ago"))
     )
     assert "\n" not in line
+
+
+def test_stats_lines_follow_the_first_line_unchanged() -> None:
+    got = injection(rules=2)
+    plain = banner(got)
+    assert banner(got, ["store     1 live", "recall    no reads logged yet"]) == (
+        plain + "\nstore     1 live\nrecall    no reads logged yet"
+    )
+
+
+def test_no_stats_is_exactly_todays_banner() -> None:
+    got = injection(rules=2)
+    assert banner(got, None) == banner(got) == banner(got, [])

@@ -86,33 +86,37 @@ def test_the_pointer_is_appended_to_the_context_block(
     live: dict[str, str], repo: Path
 ) -> None:
     _seed(live["BAG_DSN"], with_kb=True, with_handoff=True)
-    out = hook.session_start(_payload(repo), env=live)
-    assert out is not None
-    assert "A note" in out.text
-    assert "Handoff available: ci" in out.text
-    assert "bag-prime ci" in out.text
+    result = hook.session_start(_payload(repo), env=live)
+    assert result is not None
+    got, _lines = result
+    assert "A note" in got.text
+    assert "Handoff available: ci" in got.text
+    assert "bag-prime ci" in got.text
 
 
 def test_the_pointer_appears_with_no_knowledge_base_at_all(
     live: dict[str, str], repo: Path
 ) -> None:
     _seed(live["BAG_DSN"], with_kb=False, with_handoff=True)
-    out = hook.session_start(_payload(repo), env=live)
-    assert out is not None
-    assert "Handoff available: ci" in out.text
+    result = hook.session_start(_payload(repo), env=live)
+    assert result is not None
+    got, _lines = result
+    assert "Handoff available: ci" in got.text
 
 
 def test_no_handoff_means_no_pointer(live: dict[str, str], repo: Path) -> None:
     _seed(live["BAG_DSN"], with_kb=True, with_handoff=False)
-    out = hook.session_start(_payload(repo), env=live)
-    assert out is not None
-    assert "Handoff available" not in out.text
+    result = hook.session_start(_payload(repo), env=live)
+    assert result is not None
+    got, _lines = result
+    assert "Handoff available" not in got.text
 
 
 def test_nothing_at_all_still_returns_empty(live: dict[str, str], repo: Path) -> None:
     _seed(live["BAG_DSN"], with_kb=False, with_handoff=False)
-    out = hook.session_start(_payload(repo), env=live)
+    result = hook.session_start(_payload(repo), env=live)
     # The database answered, so this is an Injection with nothing in it -
     # None is reserved for a hook that never got that far.
-    assert out is not None
-    assert out.text == ""
+    assert result is not None
+    got, _lines = result
+    assert got.text == ""
