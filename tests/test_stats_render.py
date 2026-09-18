@@ -122,6 +122,31 @@ def test_inject_line_labels_the_estimate_and_follow_through() -> None:
     )
 
 
+def test_a_percentage_floors_without_paying_for_binary_float_error() -> None:
+    """0.61 renders 61% above; 0.29 is the fraction that proves the epsilon.
+
+    Percentages floor, so a rate never overstates - but `100 * 0.29` is
+    28.999999999999996, and flooring that gives 28%, which is a wrong
+    number rather than a conservative one. Delete the epsilon in `_pct`
+    and this is the test that goes red.
+    """
+    s = _stats(
+        injection=st.Injected(
+            summary=InjectionSummary(
+                first_at=WEEK_AGO,
+                sessions=14,
+                mean_rules=22.0,
+                mean_notes=8.0,
+                mean_tokens=4100.0,
+                injected=400,
+                opened=24,
+            ),
+            budget_fraction=0.29,
+        )
+    )
+    assert "· budget 29% ·" in _line(st.render(s), "inject")
+
+
 def test_a_young_log_says_since_instead_of_the_window() -> None:
     young = NOW - timedelta(days=2)
     s = _stats(

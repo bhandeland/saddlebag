@@ -143,14 +143,18 @@ def _label(name: str, text: str) -> str:
 def _pct(n: int | float, d: int | float) -> str:
     """A whole-number percentage, or `-` for a zero denominator.
 
-    Truncated rather than rounded: 37 hits out of 40 searches reads 92%,
-    which is the figure the tests pin, and understating a rate is the safe
-    direction for every number here.
+    Floored rather than rounded, so a rate can never overstate what it
+    measured: 37 hits out of 40 searches reads 92%, not the 93% rounding
+    would give it. Every number saddlebag shows a user errs toward claiming
+    less than it knows, and a hit rate is no exception.
 
-    The epsilon is for binary representation, not for rounding: a fraction
-    that arrives as a float (the budget) can be 0.29, whose product with
-    100 is 28.999999999999996, and plain truncation would report that as
-    28%. It is far smaller than any difference a whole percent can show.
+    The epsilon is the opposite case and is not a rounding fudge: a
+    fraction that arrives as a float - the budget does - can be 0.29,
+    whose product with 100 is 28.999999999999996, and flooring that
+    reports 28%, which is not conservative but wrong. The epsilon is far
+    smaller than any difference a whole percent can show, so it corrects
+    binary representation and nothing else. A test pins 0.29 rendering as
+    29% against anyone simplifying it away.
     """
     return "-" if not d else f"{int(100 * n / d + 1e-9)}%"
 
