@@ -5,12 +5,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
 from typing import Annotated, Any, NoReturn, Optional
@@ -467,6 +468,54 @@ def search(
         marker = {Match.EXACT: "", Match.SEMANTIC: "~ ", Match.FUZZY: "? "}[h.match]
         typer.echo(f"{marker}{h.entry.id}  [{h.entry.kind}] {h.entry.title}")
         typer.echo(f"    {h.snippet}")
+
+
+def _window(value: str) -> timedelta:
+    """`7d`, `24h`, `30d`. Anything else is refused - a typo silently read as
+    some default window would report numbers for a period nobody asked for."""
+    match = re.fullmatch(r"(\d+)([dh])", value.strip())
+    if not match or int(match.group(1)) == 0:
+        raise typer.BadParameter("use a number followed by d or h, e.g. 7d or 24h")
+    n = int(match.group(1))
+    return timedelta(days=n) if match.group(2) == "d" else timedelta(hours=n)
+
+
+@app.command()
+def stats(
+    project: Annotated[Optional[str], typer.Option("--project")] = None,
+    window: Annotated[str, typer.Option("--window")] = "7d",
+    recent: Annotated[int, typer.Option("--recent")] = 10,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+):
+    """How saddlebag is being used, and whether its pipelines keep up.
+
+    Reads and session starts are counted from when usage logging began; a
+    younger log says "since <date>" rather than claiming a quiet week. A
+    section that could not be read prints "unavailable" and still exits 0.
+    """
+    from saddlebag.services import stats as stats_svc
+
+    # Parsed before _session() opens anything: a bad window fails without a
+    # database, which is what test_a_bad_window_is_refused relies on.
+    period = _window(window)
+    name = _require_project(project or _default_project())
+    root = repo_root()
+    with _session() as s:
+        got = stats_svc.collect(
+            s.store,
+            s.owner.id,
+            name,
+            s.config,
+            now=datetime.now(timezone.utc),
+            window=period,
+            recent=recent,
+            current_root=root,
+        )
+    if as_json:
+        typer.echo(json.dumps(stats_svc.to_dict(got), indent=2))
+        return
+    for line in stats_svc.render(got):
+        typer.echo(line)
 
 
 @app.command()
