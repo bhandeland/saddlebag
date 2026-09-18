@@ -2334,10 +2334,11 @@ class PostgresStore:
         # `project is null` in the parameter means "every project". Written as
         # one predicate rather than two SQL strings so the owner filter exists
         # exactly once.
-        scope = (
-            "owner_id = %(owner)s and at >= %(since)s "
+        owned = (
+            "owner_id = %(owner)s "
             "and (%(project)s::text is null or project = %(project)s)"
         )
+        scope = f"{owned} and at >= %(since)s"
         args = {"owner": owner_id, "since": since, "project": project}
         with self._cur() as cur:
             cur.execute(
@@ -2346,10 +2347,16 @@ class PostgresStore:
                   count(*) as reads,
                   count(*) filter (where op = 'search') as searches,
                   count(*) filter (where op = 'search' and hits > 0) as search_hits,
-                  percentile_cont(0.5) within group (order by elapsed_ms) as p50,
+                  percentile_cont(0.5) within group (order by elapsed_ms)
+                    filter (where op = 'search') as p50,
                   count(distinct session_id) as sessions,
-                  (select min(at) from access_log where owner_id = %(owner)s)
-                    as first_at
+                  -- `owned`, not `scope`: "since" is about the whole log,
+                  -- not the window. It must carry the project predicate
+                  -- though, or a first read in a project that started
+                  -- yesterday reads as `7d: 0 reads` on an old install -
+                  -- the very "a fresh install looks like nobody recalls
+                  -- anything" failure the `since` spelling exists to stop.
+                  (select min(at) from access_log where {owned}) as first_at
                 from access_log where {scope}
                 """),
                 args,
@@ -2383,21 +2390,56 @@ class PostgresStore:
     def injection_summary(
         self, owner_id: UUID, since: datetime, project: str | None
     ) -> InjectionSummary:
+        owned = (
+            "owner_id = %(owner)s "
+            "and (%(project)s::text is null or project = %(project)s)"
+        )
         with self._cur() as cur:
             cur.execute(
-                """
+                as_sql(f"""
                 with inj as (
                   select * from injection_log
-                   where owner_id = %(owner)s and at >= %(since)s
-                     and (%(project)s::text is null or project = %(project)s)
+                   where {owned} and at >= %(since)s
                 ),
+                -- One row per SESSION, not per injection row. Claude Code
+                -- fires SessionStart on startup, resume, clear and compact,
+                -- so a single session logs several rows and `count(*)` over
+                -- `inj` would report several sessions where there was one.
+                sess as (
+                  select session_id, min(at) as at from inj
+                   where session_id is not null group by 1
+                ),
+                -- Deduped per (session, entry) on the earliest injection,
+                -- for the same reason: a session injected three times
+                -- would otherwise count its rule ids three times in
+                -- `injected` while `opened` counts each once, dragging
+                -- follow-through toward zero by how often the user
+                -- compacted.
                 ids as (
-                  select i.session_id, i.at, u.id as entry_id
+                  select i.session_id, min(i.at) as at, u.id as entry_id
                     from inj i, unnest(i.entry_ids) as u(id)
                    where i.session_id is not null
+                   group by i.session_id, u.id
                 )
                 select
-                  (select count(*) from inj) as sessions,
+                  (select count(*) from sess) as sessions,
+                  -- The two halves of the "N/M sessions" ratio, both drawn
+                  -- from `sess` so they describe one population: sessions
+                  -- that were injected, and those of them that then read.
+                  -- A session that read without an injection row - every
+                  -- cursor and opencode session today, since the CLI reads
+                  -- its session id from a Claude Code variable - is outside
+                  -- the ratio entirely rather than inflating one side of
+                  -- it. Not project-scoped on the access side: the
+                  -- population is already pinned by `sess`, and a session
+                  -- that read from a subdirectory filed under another
+                  -- project still followed through.
+                  (select count(*) from sess s
+                    where exists (
+                      select 1 from access_log a
+                       where a.owner_id = %(owner)s
+                         and a.session_id = s.session_id
+                         and a.at >= s.at)) as sessions_read,
                   (select avg(rules) from inj) as mean_rules,
                   (select avg(notes) from inj) as mean_notes,
                   (select avg(tokens_est) from inj) as mean_tokens,
@@ -2412,15 +2454,20 @@ class PostgresStore:
                          and a.session_id = ids.session_id
                          and a.at >= ids.at
                          and ids.entry_id = any(a.entry_ids))) as opened,
-                  (select min(at) from injection_log where owner_id = %(owner)s)
-                    as first_at
-                """,
+                  -- `owned`, not the window: "since" is about the whole
+                  -- log. It carries the project predicate for the reason
+                  -- `access_summary` gives - an owner-wide `min(at)` makes
+                  -- a project logged for the first time yesterday read as
+                  -- a silent week on an old install.
+                  (select min(at) from injection_log where {owned}) as first_at
+                """),
                 {"owner": owner_id, "since": since, "project": project},
             )
             row = _one(cur)
         return InjectionSummary(
             first_at=row["first_at"],
             sessions=int(row["sessions"]),
+            sessions_read=int(row["sessions_read"]),
             mean_rules=float(row["mean_rules"] or 0),
             mean_notes=float(row["mean_notes"] or 0),
             mean_tokens=float(row["mean_tokens"] or 0),

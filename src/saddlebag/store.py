@@ -423,6 +423,10 @@ class Store(Protocol):
     def access_summary(
         self, owner_id: UUID, since: datetime, project: str | None
     ) -> AccessSummary: ...
+    #: Counts SESSIONS, not injection rows - one session logs a row per
+    #: startup, resume, clear and compact - and it owns both halves of the
+    #: "read after injection" ratio, so the two can never be drawn from
+    #: different populations.
     def injection_summary(
         self, owner_id: UUID, since: datetime, project: str | None
     ) -> InjectionSummary: ...

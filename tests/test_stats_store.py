@@ -137,7 +137,10 @@ def test_access_summary(store, me, other) -> None:
     assert got.by_op == {"search": 3, "get": 1}
     assert (got.searches, got.search_hits) == (3, 2)
     assert got.tiers == {"exact": 1, "semantic": 1, "none": 1}
-    assert got.p50_ms == 15
+    # Searches only: the 5ms `get` is not part of what the recall line
+    # calls p50, or a session that read more single-row entries would
+    # report faster searches.
+    assert got.p50_ms == 20
     assert got.sessions == 2
     assert store.access_summary(me.id, LONG_AGO, None).reads == 5
 
@@ -158,11 +161,76 @@ def test_follow_through_counts_injected_ids_opened_later_in_that_session(
     _read(store, me, session="s1", op="get", ids=(a,))
     _read(store, me, session="s2", op="get", ids=(b,))  # different session
     _inject(store, me, session=None, ids=(c,))  # no session: not countable
+    _inject(store, other, session="s9", ids=(a,))  # other principal
     _read(store, other, session="s1", op="get", ids=(b,))  # other principal
     got = store.injection_summary(me.id, LONG_AGO, None)
-    assert got.sessions == 2
+    # One session: the row with no session id names no session to count,
+    # and the other principal's is not ours.
+    assert got.sessions == 1
     assert (got.injected, got.opened) == (2, 1)
+    # The means still average rows - two of them, both mine.
     assert got.mean_tokens == pytest.approx((200 + 100) / 2)
+
+
+def test_one_session_injected_several_times_is_one_session(store, me) -> None:
+    """Claude Code fires SessionStart on startup, resume, clear AND compact.
+
+    Counting rows called three injections three sessions and, worse,
+    counted the same session's entry ids three times in `injected` while
+    `opened` counted each once - dragging follow-through toward zero by how
+    often the user compacted.
+    """
+    a, b = new_id(), new_id()
+    for _ in range(3):
+        _inject(store, me, session="s1", ids=(a, b))
+    _read(store, me, session="s1", op="get", ids=(a,))
+    got = store.injection_summary(me.id, LONG_AGO, None)
+    assert got.sessions == 1
+    assert (got.injected, got.opened) == (2, 1)
+
+
+def test_the_session_ratio_counts_injected_sessions_that_then_read(
+    store, me, other
+) -> None:
+    """Both halves come from `injection_log`, so they are one population.
+
+    A session that read without ever being injected - every cursor and
+    opencode session, whose reads carry no session id - is outside the
+    ratio rather than inflating its denominator.
+    """
+    _inject(store, me, session="s1", ids=())
+    _inject(store, me, session="s2", ids=())
+    _read(store, me, session="s1")
+    _read(store, me, session="s3")  # read, never injected: outside the ratio
+    _inject(store, other, session="s4", ids=())
+    _read(store, other, session="s4")
+    got = store.injection_summary(me.id, LONG_AGO, None)
+    assert (got.sessions_read, got.sessions) == (1, 2)
+    assert got.sessions_read <= got.sessions
+
+
+def test_a_read_before_its_injection_is_not_follow_through(store, me) -> None:
+    _read(store, me, session="s1")
+    _inject(store, me, session="s1", ids=())
+    got = store.injection_summary(me.id, LONG_AGO, None)
+    assert (got.sessions_read, got.sessions) == (0, 1)
+
+
+def test_since_is_scoped_to_the_project_the_counts_are(store, me) -> None:
+    """`min(at)` carries the project predicate the rest of the query does.
+
+    Owner-wide, a project logged for the first time today reads as
+    `7d: 0 reads` on an install that has been logging for months - the
+    "a fresh install looks like nobody recalls anything" failure the
+    `since` spelling exists to prevent, one level down.
+    """
+    _read(store, me, project="elsewhere")
+    _inject(store, me, project="elsewhere")
+    assert store.access_summary(me.id, LONG_AGO, "demo").first_at is None
+    assert store.injection_summary(me.id, LONG_AGO, "demo").first_at is None
+    assert store.access_summary(me.id, LONG_AGO, "elsewhere").first_at is not None
+    assert store.injection_summary(me.id, LONG_AGO, "elsewhere").first_at is not None
+    assert store.access_summary(me.id, LONG_AGO, None).first_at is not None
 
 
 def test_recent_entries_newest_first_and_owner_scoped(store, me, other) -> None:

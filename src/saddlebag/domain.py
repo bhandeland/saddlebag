@@ -635,14 +635,16 @@ class EntryCounts:
 class AccessSummary:
     """A window of `access_log` rows, aggregated for `bag stats`."""
 
-    first_at: datetime | None  # earliest access_log row ever, for "since"
+    #: The earliest row for this project, ever, for the "since" spelling -
+    #: the window never bounds it, the project always does.
+    first_at: datetime | None
     reads: int
     by_source: dict[str, int]
     by_op: dict[str, int]
     searches: int
     search_hits: int  # searches with hits > 0
     tiers: dict[str, int]  # searches only, tier -> count, incl. "none"
-    p50_ms: int | None
+    p50_ms: int | None  # searches only, so it means what the recall line implies
     sessions: int  # distinct non-null session ids that read
 
 
@@ -651,11 +653,18 @@ class InjectionSummary:
     """A window of `injection_log` rows, plus the follow-through join."""
 
     first_at: datetime | None
+    #: Distinct session ids, not rows: Claude Code fires SessionStart on
+    #: startup, resume, clear and compact alike, so one session logs several
+    #: rows and counting rows would inflate the headline figure.
     sessions: int
+    #: Of those sessions, the ones that went on to read the store. The
+    #: numerator and `sessions` the denominator of one ratio drawn from one
+    #: population - see `injection_summary` for why that matters.
+    sessions_read: int
     mean_rules: float
     mean_notes: float
     mean_tokens: float
-    injected: int  # sum of cardinality(entry_ids) over sessions with an id
+    injected: int  # distinct (session, entry) pairs handed to a session
     opened: int  # of those, opened later in the same session
 
 
