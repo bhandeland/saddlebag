@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
+from dataclasses import fields
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
+
+import pytest
 
 from saddlebag.domain import (
     AccessSummary,
     Entry,
     EntryCounts,
+    IngestRun,
+    IngestTrigger,
     InjectionSummary,
     Kind,
+    MemoryRun,
+    MemoryTrigger,
     Origin,
     PipelineCounts,
 )
@@ -18,6 +25,10 @@ from saddlebag.services import stats as st
 
 NOW = datetime(2026, 9, 16, 12, 0, tzinfo=timezone.utc)
 WEEK_AGO = NOW - timedelta(days=30)
+
+#: The `Stats` fields that are not sections, in order. Named here so the
+#: drift guard below can say where the sections start.
+META_FIELDS = ("project", "window", "now")
 
 
 def _stats(**kw: object) -> st.Stats:
@@ -91,6 +102,165 @@ def _stats(**kw: object) -> st.Stats:
 
 def _line(lines: list[str], label: str) -> str:
     return next(line for line in lines if line.startswith(label))
+
+
+def test_sections_is_every_stats_section_and_nothing_else() -> None:
+    """`SECTIONS` drives both `render` and `to_dict`.
+
+    `render` already raises a KeyError for a section missing from
+    `_RENDERERS`, but a section added to `Stats` and forgotten in
+    `SECTIONS` raises nothing at all - it simply never renders and never
+    appears in the JSON, which is the "silently vanishes" failure this
+    repo keeps warning about for origins.
+    """
+    names = tuple(f.name for f in fields(st.Stats))
+    assert names[: len(META_FIELDS)] == META_FIELDS
+    assert st.SECTIONS == names[len(META_FIELDS) :]
+
+
+@pytest.mark.parametrize(
+    ("n", "d", "want"),
+    [
+        (37, 40, "92%"),  # floors: never overstates a rate
+        (1, 40, "2%"),
+        (0.29, 1, "29%"),  # the epsilon: 100 * 0.29 is 28.999999999999996
+        (0, 40, "0%"),
+        (40, 40, "100%"),
+        (0, 0, "-"),  # a zero denominator is not a zero percent
+        (7, 0, "-"),
+    ],
+)
+def test_percentages(n: float, d: float, want: str) -> None:
+    assert st._pct(n, d) == want
+
+
+def test_a_zero_denominator_reaches_the_rendered_line_as_a_dash() -> None:
+    s = _stats(
+        injection=st.Injected(
+            summary=InjectionSummary(
+                first_at=WEEK_AGO,
+                sessions=3,
+                mean_rules=0.0,
+                mean_notes=0.0,
+                mean_tokens=940.0,
+                injected=0,
+                opened=0,
+            ),
+            budget_fraction=None,
+        )
+    )
+    line = _line(st.render(s), "inject")
+    assert "follow-through - (0/0)" in line
+    # No knowledge base, so no budget clause at all rather than a zero.
+    assert "budget" not in line
+    # Under a thousand, an estimate is the count itself.
+    assert "~940 tokens avg (est)" in line
+
+
+def test_pipes_names_every_run_state_and_where_to_read_advisories() -> None:
+    """The four spellings `_run_age` has, in one line.
+
+    "never" (no row), "unknown" (a row that cannot say when it started),
+    an age, and an age plus "(did not finish)" are four different
+    statements, and a run that crashed must not read as one that ran.
+    """
+    s = _stats(
+        pipelines=st.Pipelines(
+            counts=PipelineCounts(
+                transcript_sessions=155,
+                transcript_subagents=288,
+                last_transcript_run=None,
+                last_memory_run=MemoryRun(
+                    id=UUID(int=2),
+                    owner_id=UUID(int=1),
+                    project="demo",
+                    trigger=MemoryTrigger.AUTO,
+                    started_at=NOW - timedelta(hours=3),
+                    finished_at=NOW - timedelta(hours=3),
+                ),
+                last_ingest_run=IngestRun(
+                    id=UUID(int=3),
+                    owner_id=UUID(int=1),
+                    project="demo",
+                    trigger=IngestTrigger.MANUAL,
+                    started_at=NOW - timedelta(days=1),
+                    finished_at=None,
+                ),
+                extracted_since=12,
+            ),
+            advisories=2,
+        )
+    )
+    assert _line(st.render(s), "pipes") == (
+        "pipes     transcripts 155 sessions 288 subagents, last never"
+        " · memory last 3h ago · ingest last 1d ago (did not finish)"
+        " · 2 advisories - run bag record status"
+    )
+
+
+def test_a_run_row_that_cannot_say_when_it_started_is_not_never() -> None:
+    s = _stats(
+        pipelines=st.Pipelines(
+            counts=PipelineCounts(
+                transcript_sessions=0,
+                transcript_subagents=0,
+                last_transcript_run=None,
+                last_memory_run=MemoryRun(
+                    id=UUID(int=2),
+                    owner_id=UUID(int=1),
+                    project="demo",
+                    trigger=MemoryTrigger.AUTO,
+                ),
+                last_ingest_run=None,
+                extracted_since=0,
+            ),
+            advisories=0,
+        )
+    )
+    line = _line(st.render(s), "pipes")
+    assert "memory last unknown" in line
+    # No advisories, so no pointer to a command with nothing to show.
+    assert "run bag record status" not in line
+
+
+def test_a_long_title_is_cut_and_later_entries_line_up_under_the_first() -> None:
+    long_title = "R" * 70
+    s = _stats(
+        recent=[
+            Entry(
+                id=UUID("01a0ac4c-9ad9-75f9-9819-2cca6840d456"),
+                kind=Kind.NOTE,
+                title=long_title,
+                body="",
+                owner_id=UUID(int=1),
+                origin=Origin.AGENT,
+                project="demo",
+                created_at=NOW - timedelta(minutes=2),
+            ),
+            Entry(
+                id=UUID("01a0ac4c-9ad9-75f9-9819-2cca6840d457"),
+                kind=Kind.RULE,
+                title="Short",
+                body="",
+                owner_id=UUID(int=1),
+                origin=Origin.HUMAN,
+                project="demo",
+                created_at=NOW - timedelta(hours=5),
+            ),
+        ]
+    )
+    lines = st.render(s)
+    first = _line(lines, "recent")
+    second = lines[lines.index(first) + 1]
+    assert f"{'R' * 57}..." in first
+    assert len(long_title) > st.MAX_TITLE and "R" * 58 not in first
+    assert second == f"{' ' * st.LABEL_WIDTH}5h ago  rule  01a0ac4c  Short  [human]"
+
+
+def test_nothing_written_yet_says_so() -> None:
+    assert _line(st.render(_stats(recent=[])), "recent") == (
+        "recent    nothing written yet"
+    )
 
 
 def test_every_section_has_a_labelled_line() -> None:

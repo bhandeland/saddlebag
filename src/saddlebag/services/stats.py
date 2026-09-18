@@ -452,12 +452,18 @@ def _budget(store: Store, owner_id: UUID, project: str, max_chars: int) -> float
 
     A project with no knowledge base is an ordinary state - the commonest
     one, in fact - so it is None rather than an unavailable section.
+
+    `kb.budget` already is that computation, and its `fraction` carries a
+    zero guard naming this exact caller: `max_chars` comes from user
+    config, and a status line must never be the thing that raises. A
+    second copy of get -> resolve -> rules_chars here would have divided
+    by a `BAG_MAX_CHARS=0` and turned the whole injection section into
+    `unavailable (ZeroDivisionError)`.
     """
     try:
-        collection = kb.get(store, owner_id, project)
+        return kb.budget(store, owner_id, project, max_chars).fraction
     except kb.CollectionNotFound:
         return None
-    return kb.rules_chars(collection, kb.resolve(store, owner_id, project)) / max_chars
 
 
 def collect(
@@ -515,6 +521,11 @@ def collect(
         return Vectors(embedded=embedded, total=total, model=config.embed_model)
 
     def extract() -> Extraction:
+        # 1000 bounds the discovery query, not the number returned (see
+        # `awaiting_sessions`), so a backlog past a thousand candidates
+        # reports low. Acceptable for one line of a banner: the figure is
+        # there to say "extraction has work", and `bag record status` is
+        # where a real backlog is investigated.
         awaiting = extraction.awaiting_sessions(
             store, owner_id, config.idle_minutes * 60, 1000
         )

@@ -439,8 +439,13 @@ class Store(Protocol):
         from a session-start hook with ten seconds for everything it does,
         and a section that cannot answer in time must become one
         "unavailable" line rather than cost the caller its other sections.
-        Nothing else in this codebase wants a timeout, so it is set where it
-        is needed and unset again when that transaction ends.
+        Nothing else in this codebase wants a timeout, so it is set where
+        it is needed. `set local` outlives the savepoint it was set inside
+        - it lasts until the *enclosing* transaction ends - so a caller
+        that opens one transaction and collects several sections inside it
+        sets the same value repeatedly and every statement in that
+        transaction, including the caller's own afterwards, is capped
+        until it commits or rolls back.
         """
         ...
 

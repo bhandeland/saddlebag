@@ -12,6 +12,8 @@ import pytest
 from saddlebag.backends.postgres.migrate import migrate
 from saddlebag.backends.postgres.store import PostgresStore
 from saddlebag.config import load
+from saddlebag.domain import CollectionQuery, Kind
+from saddlebag.services import kb
 from saddlebag.services import stats as st
 
 pytestmark = pytest.mark.db
@@ -33,6 +35,36 @@ def test_collect_on_an_empty_store_has_every_section(
         assert not isinstance(getattr(got, name), st.Unavailable), name
     assert isinstance(got.injection, st.Injected)
     assert got.injection.budget_fraction is None  # no knowledge base
+
+
+def test_a_zero_budget_is_a_null_fraction_rather_than_a_dead_section(
+    store: PostgresStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`BAG_MAX_CHARS=0` must not divide by zero.
+
+    The fraction goes through `kb.Budget.fraction`, whose zero guard names
+    this caller: `max_chars` is user config, and a status line must never
+    be the thing that raises. Computing it here instead turned the whole
+    injection section into `unavailable (ZeroDivisionError)`.
+    """
+    monkeypatch.setenv("BAG_CONFIG", str(tmp_path / "none.toml"))
+    monkeypatch.setenv("BAG_MAX_CHARS", "0")
+    owner = store.ensure_principal("brandon")
+    config = load()
+    assert config.max_chars == 0
+    kb.create(
+        store,
+        owner.id,
+        slug="demo",
+        title="demo",
+        project="demo",
+        query=CollectionQuery(kinds=[Kind.RULE]),
+    )
+
+    got = st.collect(store, owner.id, "demo", config, now=datetime.now(timezone.utc))
+
+    assert isinstance(got.injection, st.Injected)
+    assert got.injection.budget_fraction == 0.0
 
 
 def test_a_section_that_raises_becomes_unavailable_and_the_rest_survive(
