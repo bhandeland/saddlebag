@@ -1213,6 +1213,7 @@ def hook_context(
                 cfg.max_chars,
                 note=lambda reason: debug(env, reason),
                 owner_handle=s.owner.handle,
+                log=context.InjectionLog(agent, identity.session_id),
             )
 
         # Delivery is the adapter's business, not the frontend's. An

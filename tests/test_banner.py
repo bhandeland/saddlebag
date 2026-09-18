@@ -18,6 +18,7 @@ def injection(**kw: object) -> Injection:
         notes=0,
         recording=False,
         handoff=None,
+        entry_ids=(),
     )
     base.update(kw)
     return Injection(**base)  # type: ignore[arg-type]

@@ -57,6 +57,7 @@ def session_start(stdin_text: str, env: Mapping[str, str]) -> context.Injection 
                 config.max_chars,
                 note=lambda reason: _debug(env, reason),
                 owner_handle=s.owner.handle,
+                log=context.InjectionLog("claude-code", identity.session_id),
             )
     except Exception as exc:
         # Any failure at all - unreachable database, missing migrations, an

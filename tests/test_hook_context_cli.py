@@ -219,6 +219,21 @@ def test_context_prints_the_knowledge_base_for_the_session(
     assert "Run ruff linter" in result.stdout
 
 
+def test_hook_context_logs_the_injection_with_its_harness(env: str, repo: Path) -> None:
+    _seed_kb(env)
+    result = runner.invoke(
+        app,
+        ["hook", "context", "--agent", "claude-code"],
+        input=json.dumps({"cwd": str(repo), "session_id": "sess-7"}),
+    )
+    assert result.exit_code == 0
+    assert "Lint rule" in result.stdout
+    with psycopg.connect(env) as c:
+        assert c.execute(
+            "select harness, session_id, found, rules from injection_log"
+        ).fetchall() == [("claude-code", "sess-7", True, 1)]
+
+
 def test_context_reads_a_named_agent_and_matches_the_default(
     env: str, repo: Path
 ) -> None:

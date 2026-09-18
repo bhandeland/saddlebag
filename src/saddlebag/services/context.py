@@ -16,7 +16,8 @@ from datetime import datetime
 from typing import Callable
 from uuid import UUID
 
-from saddlebag.services import kb, record
+from saddlebag.domain import InjectionRecord
+from saddlebag.services import kb, record, usage
 from saddlebag.store import Store
 
 
@@ -24,6 +25,19 @@ from saddlebag.store import Store
 class Handoff:
     topic: str
     age: str
+
+
+@dataclass(frozen=True)
+class InjectionLog:
+    """Who is asking, for the injection log. Passing one is the opt-in.
+
+    Without it `injection()` writes nothing - the same bargain `search.find`
+    strikes with `source`: internal callers and tests that construct an
+    `Injection` directly must not show up in usage statistics.
+    """
+
+    harness: str
+    session_id: str | None
 
 
 @dataclass(frozen=True)
@@ -35,7 +49,8 @@ class Injection:
     knowledge base (`project`), whether one existed (`found`), how many
     rules and notes the block actually carried (`rules`, `notes` - notes are
     dropped whole for budget, so this is the renderer's count, not the
-    resolver's), whether the project records events, and the live handoff.
+    resolver's), whether the project records events, the live handoff, and
+    which entries the block carried (`entry_ids`, for the injection log).
     """
 
     text: str
@@ -45,6 +60,7 @@ class Injection:
     notes: int
     recording: bool
     handoff: Handoff | None
+    entry_ids: tuple[UUID, ...] = ()
 
 
 def block(
@@ -54,13 +70,14 @@ def block(
     max_chars: int,
     note: Callable[[str], None] | None = None,
     owner_handle: str | None = None,
+    log: InjectionLog | None = None,
 ) -> str:
     """The knowledge base context block for one project, or "".
 
     `injection()` with only the text kept - what every caller that has no
     channel to a human wants (`bag hook context`, opencode, Cursor).
     """
-    return injection(store, owner_id, project, max_chars, note, owner_handle).text
+    return injection(store, owner_id, project, max_chars, note, owner_handle, log).text
 
 
 def injection(
@@ -70,6 +87,7 @@ def injection(
     max_chars: int,
     note: Callable[[str], None] | None = None,
     owner_handle: str | None = None,
+    log: InjectionLog | None = None,
 ) -> Injection:
     """The context block for one project, plus the facts about it.
 
@@ -92,12 +110,25 @@ def injection(
     BAG_USER_ID is one of the likeliest reasons for silent injection.
     Passing "" or leaving it unset just drops that clause; it never changes
     whether a caller is told anything.
+
+    `log` is the opt-in for the injection log (see `InjectionLog`): passing
+    one writes a row through `usage.log_injection`, itself fail-soft, so a
+    broken log write costs only the log, never the session. Without it
+    nothing is written, which is what keeps internal callers and tests that
+    build an `Injection` directly out of usage statistics.
+
+    `kb.render_block` raises `RulesExceedBudget` before this function knows
+    anything worth logging - an over-budget knowledge base was never
+    rendered, so there is no `chars` or `entry_ids` to write, and the raise
+    is left to propagate uncaught rather than caught and logged as a
+    failure.
     """
     say = note or (lambda _reason: None)
 
     rendered = ""
     found = False
     rules = notes = 0
+    ids: tuple[UUID, ...] = ()
     try:
         collection = kb.get(store, owner_id, project)
     except kb.CollectionNotFound:
@@ -113,6 +144,7 @@ def injection(
         if entries:
             block_ = kb.render_block(collection, entries, max_chars)
             rendered, rules, notes = block_.text, block_.rules, block_.notes
+            ids = block_.entry_ids
         else:
             say(f"knowledge base '{project}' matched no entries")
 
@@ -122,7 +154,7 @@ def injection(
     # all, which is why the block is built rather than returned early.
     live = live_handoff(store, owner_id, project)
     pointer = handoff_pointer(live)
-    return Injection(
+    got = Injection(
         text="\n".join(part for part in (rendered, pointer) if part),
         project=project,
         found=found,
@@ -130,7 +162,26 @@ def injection(
         notes=notes,
         recording=_recording(store, owner_id, project),
         handoff=live,
+        entry_ids=ids,
     )
+    if log is not None:
+        usage.log_injection(
+            store,
+            InjectionRecord(
+                owner_id=owner_id,
+                project=project,
+                harness=log.harness,
+                session_id=log.session_id,
+                found=found,
+                rules=rules,
+                notes=notes,
+                chars=len(got.text),
+                budget_chars=max_chars,
+                entry_ids=ids,
+            ),
+            note=say,
+        )
+    return got
 
 
 def _recording(store: Store, owner_id: UUID, project: str) -> bool:

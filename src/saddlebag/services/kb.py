@@ -438,12 +438,16 @@ class Rendered:
     rule is never dropped; `notes` is only the notes that fit, and
     `notes_dropped` the rest - counting resolved entries would claim notes
     the block never carried.
+
+    `entry_ids` is what the block carried, for the injection log - rules,
+    then the notes that fit.
     """
 
     text: str
     rules: int
     notes: int
     notes_dropped: int
+    entry_ids: tuple[UUID, ...]
 
 
 def render(collection: Collection, entries: list[Entry], max_chars: int) -> str:
@@ -478,12 +482,17 @@ def render_block(
     heading = "\n## Knowledge\n"
     included = 0
     body_parts: list[str] = []
+    # Parallel to body_parts, popped together below - entry_ids must name
+    # exactly the notes that made it into the rendered text, not every note
+    # that was tried.
+    included_ids: list[UUID] = []
     for e in others:
         chunk = _render_entry(e)
         extra = len(chunk) + (len(heading) if not body_parts else 0)
         if used + extra > max_chars:
             break
         body_parts.append(chunk)
+        included_ids.append(e.id)
         used += extra
         included += 1
 
@@ -496,6 +505,7 @@ def render_block(
         if not body_parts:
             break
         used -= len(body_parts.pop())
+        included_ids.pop()
         included -= 1
         if not body_parts:
             used -= len(heading)
@@ -515,4 +525,6 @@ def render_block(
         rules=len(entries) - len(others),
         notes=included,
         notes_dropped=omitted,
+        entry_ids=tuple(e.id for e in entries if e.kind == Kind.RULE)
+        + tuple(included_ids),
     )
