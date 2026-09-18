@@ -2492,6 +2492,17 @@ class PostgresStore:
             extracted_since=extracted,
         )
 
+    def set_statement_timeout(self, ms: int) -> None:
+        # `set local` takes no bind parameter - Postgres parses the value
+        # at parse time, so psycopg cannot send it as one - which is why
+        # this is the rare interpolation. `int()` is what makes it safe:
+        # the only thing that can reach the query text is a decimal
+        # integer, whatever the caller passed. `as_sql` is called
+        # deliberately, as its docstring asks, so the exemption is
+        # greppable.
+        with self._cur() as cur:
+            cur.execute(as_sql(f"set local statement_timeout = {int(ms)}"))
+
     def transaction(self) -> AbstractContextManager[Any]:
         # psycopg's own transaction() already does exactly what the
         # Protocol promises: a real transaction under autocommit, a

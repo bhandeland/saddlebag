@@ -432,6 +432,18 @@ class Store(Protocol):
     #: Runs are the newest across all projects for this owner.
     def pipeline_counts(self, owner_id: UUID, since: datetime) -> PipelineCounts: ...
 
+    def set_statement_timeout(self, ms: int) -> None:
+        """Bound the statements in the transaction this is called inside.
+
+        Local to that transaction, not the connection: `bag stats` is read
+        from a session-start hook with ten seconds for everything it does,
+        and a section that cannot answer in time must become one
+        "unavailable" line rather than cost the caller its other sections.
+        Nothing else in this codebase wants a timeout, so it is set where it
+        is needed and unset again when that transaction ends.
+        """
+        ...
+
     #: `Any`, not `None`: what the context manager yields is deliberately
     #: not part of this contract - callers use a bare `with` and never bind
     #: it - and naming psycopg's `Transaction` here would drag the driver
