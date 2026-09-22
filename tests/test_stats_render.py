@@ -60,7 +60,7 @@ def _stats(**kw: object) -> st.Stats:
             summary=InjectionSummary(
                 first_at=WEEK_AGO,
                 sessions=14,
-                sessions_read=11,
+                sessions_read=9,
                 mean_rules=22.0,
                 mean_notes=8.0,
                 mean_tokens=4100.0,
@@ -284,7 +284,7 @@ def test_store_line() -> None:
 def test_recall_line_carries_rate_tiers_and_latency() -> None:
     line = _line(st.render(_stats()), "recall")
     assert line == (
-        "recall    7d: 48 reads in 11/14 sessions · hit 92% (37/40)"
+        "recall    7d: 48 reads in 9/14 sessions · hit 92% (37/40)"
         " · exact 55% semantic 40% fuzzy 2% none 2% · p50 180ms"
     )
 
@@ -310,7 +310,7 @@ def test_a_percentage_floors_without_paying_for_binary_float_error() -> None:
             summary=InjectionSummary(
                 first_at=WEEK_AGO,
                 sessions=14,
-                sessions_read=11,
+                sessions_read=9,
                 mean_rules=22.0,
                 mean_notes=8.0,
                 mean_tokens=4100.0,
@@ -454,7 +454,10 @@ def test_the_session_ratio_is_drawn_from_the_injected_population() -> None:
     `1/0`.
     """
     line = _line(st.render(_stats()), "recall")
-    assert "48 reads in 11/14 sessions" in line
+    # 9, not the fixture's 11 distinct reading sessions: the two differ on
+    # purpose, or this assertion passes under the old access_log numerator
+    # too and guards nothing.
+    assert "48 reads in 9/14 sessions" in line
 
 
 def test_without_the_injection_section_there_is_no_ratio_to_draw() -> None:
